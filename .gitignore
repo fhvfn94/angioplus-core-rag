@@ -1,0 +1,28 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# IDE / OS
+.cursor/
+desktop.ini
+Thumbs.db
+.DS_Store
+
+# Build / cache
+*.egg-info/
+dist/
+build/
+
+# Local data outputs (keep source documents in data/)
+data/processed/
+
+
+qdrant_storage/
+*.pyc

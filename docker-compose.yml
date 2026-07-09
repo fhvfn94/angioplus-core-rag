@@ -1,0 +1,38 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+
+  rag:
+    build: .
+    depends_on:
+      - qdrant
+    working_dir: /app
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+  bot:
+    build: .
+    depends_on:
+      - rag
+    working_dir: /app
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      RAG_API_URL: http://rag:8000/ask
+    command: python bot/main.py
+
+volumes:
+  qdrant_storage:

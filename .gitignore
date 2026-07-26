@@ -1,5 +1,6 @@
 # Secrets
 .env
+.env.voice-test
 
 # Python
 __pycache__/
@@ -26,3 +27,4 @@ data/processed/
 
 qdrant_storage/
 *.pyc
+.pytest_cache/

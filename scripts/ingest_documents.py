@@ -30,6 +30,37 @@ class Chunk:
     metadata: dict
 
 
+def build_embedding_text(
+    file_name: str | None,
+    document_type: str | None,
+    section: str | None,
+    page_start: int | None,
+    page_end: int | None,
+    text: str,
+) -> str:
+    parts: list[str] = []
+
+    if file_name:
+        parts.append(f"Документ: {file_name}")
+    if document_type:
+        parts.append(f"Тип документа: {document_type}")
+    if section:
+        parts.append(f"Раздел: {section}")
+
+    if page_start is not None or page_end is not None:
+        if page_start is not None and page_end is not None:
+            parts.append(f"Страницы: {page_start}-{page_end}")
+        elif page_start is not None:
+            parts.append(f"Страницы: {page_start}")
+        else:
+            parts.append(f"Страницы: {page_end}")
+
+    if parts:
+        parts.append("")
+    parts.append(text or "")
+    return "\n".join(parts)
+
+
 class SegmentExtractor:
     """Returns ordered (page_1_based, text_block) segments."""
 
@@ -713,7 +744,19 @@ class IngestionPipeline:
             logging.warning("No chunks generated.")
             return {"documents": len(paths), "chunks": 0}
 
-        vectors = self.embedder.embed_texts([chunk.text for chunk in all_chunks])
+        vectors = self.embedder.embed_texts(
+            [
+                build_embedding_text(
+                    file_name=chunk.metadata.get("file_name"),
+                    document_type=chunk.metadata.get("document_type"),
+                    section=chunk.metadata.get("section"),
+                    page_start=chunk.metadata.get("page_start"),
+                    page_end=chunk.metadata.get("page_end"),
+                    text=chunk.text,
+                )
+                for chunk in all_chunks
+            ]
+        )
         vec_size = len(vectors[0]) if vectors else 0
 
         embedding_model_label = self.embedder.model_label

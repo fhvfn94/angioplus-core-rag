@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Test tooling
+pytest>=8.0,<9
+pytest-asyncio>=0.23,<1
+pytest-cov>=5.0,<8

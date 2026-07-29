@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from google import genai
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 DEFAULT_COLLECTION = "angioplus_documents"
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
@@ -18,13 +25,30 @@ SYSTEM_PROMPT_PATH = os.getenv(
     "SYSTEM_PROMPT_PATH",
     "app/prompts/system_prompt.md",
 )
+FALLBACK_SYSTEM_PROMPT = (
+    "Ты — технический ассистент поддержки AngioPlus Core. "
+    "Отвечай строго на основе контекста."
+)
+NOT_FOUND_ANSWER = "Такой информации нет в имеющейся документации."
 
 app = FastAPI(title="AngioPlus Core RAG Assistant")
 
 
+class EmbeddingError(RuntimeError):
+    """Query embedding could not be produced."""
+
+
+class RetrievalError(RuntimeError):
+    """Vector search failed."""
+
+
+class GenerationError(RuntimeError):
+    """Answer generation failed or was blocked."""
+
+
 class AskRequest(BaseModel):
     question: str
-    top_k: int = 5
+    top_k: int = Field(default=5, ge=1, le=50)
 
 
 class Source(BaseModel):
@@ -44,6 +68,7 @@ def get_api_key() -> str:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
 
     if not api_key:
+        logger.error("GEMINI_API_KEY is not set; cannot serve requests")
         raise HTTPException(
             status_code=500,
             detail="GEMINI_API_KEY is not set",
@@ -59,21 +84,26 @@ def create_gemini_client(api_key: str) -> genai.Client:
 def embed_query(api_key: str, question: str) -> list[float]:
     client = create_gemini_client(api_key)
 
-    response = client.models.embed_content(
-        model=DEFAULT_GEMINI_EMBEDDING_MODEL,
-        contents=question,
-        config=types.EmbedContentConfig(
-            task_type="RETRIEVAL_QUERY",
-        ),
-    )
+    try:
+        response = client.models.embed_content(
+            model=DEFAULT_GEMINI_EMBEDDING_MODEL,
+            contents=question,
+            config=types.EmbedContentConfig(
+                task_type="RETRIEVAL_QUERY",
+            ),
+        )
+    except Exception as exc:
+        raise EmbeddingError(
+            f"Gemini embedding request failed: {exc}"
+        ) from exc
 
     if not response.embeddings:
-        raise RuntimeError("Gemini returned no query embedding")
+        raise EmbeddingError("Gemini returned no query embedding")
 
     embedding = response.embeddings[0]
 
     if not embedding.values:
-        raise RuntimeError("Gemini returned an empty query embedding")
+        raise EmbeddingError("Gemini returned an empty query embedding")
 
     return list(embedding.values)
 
@@ -81,12 +111,20 @@ def embed_query(api_key: str, question: str) -> list[float]:
 def search_qdrant(vector: list[float], top_k: int):
     client = QdrantClient(url=DEFAULT_QDRANT_URL)
 
-    response = client.query_points(
-        collection_name=DEFAULT_COLLECTION,
-        query=vector,
-        limit=top_k,
-        with_payload=True,
-    )
+    try:
+        response = client.query_points(
+            collection_name=DEFAULT_COLLECTION,
+            query=vector,
+            limit=top_k,
+            with_payload=True,
+        )
+    except Exception as exc:
+        raise RetrievalError(
+            f"Qdrant search in collection "
+            f"{DEFAULT_COLLECTION!r} failed: {exc}"
+        ) from exc
+    finally:
+        client.close()
 
     return list(response.points)
 
@@ -96,7 +134,12 @@ def build_context(chunks: list[Any]) -> str:
 
     for i, chunk in enumerate(chunks, 1):
         payload = chunk.payload or {}
-        text = payload.get("text", "")
+        text = (payload.get("text") or "").strip()
+
+        if not text:
+            logger.warning("Chunk %s has no text payload, skipping it", i)
+            continue
+
         parts.append(f"[Chunk {i}]\n{text}")
 
     return "\n\n".join(parts)
@@ -105,12 +148,24 @@ def build_context(chunks: list[Any]) -> str:
 def load_system_prompt() -> str:
     try:
         with open(SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as file:
-            return file.read().strip()
-    except FileNotFoundError:
-        return (
-            "Ты — технический ассистент поддержки AngioPlus Core. "
-            "Отвечай строго на основе контекста."
+            prompt = file.read().strip()
+    except OSError as exc:
+        logger.warning(
+            "Falling back to the built-in system prompt, "
+            "%r could not be read: %s",
+            SYSTEM_PROMPT_PATH,
+            exc,
         )
+        return FALLBACK_SYSTEM_PROMPT
+
+    if not prompt:
+        logger.warning(
+            "Falling back to the built-in system prompt, %r is empty",
+            SYSTEM_PROMPT_PATH,
+        )
+        return FALLBACK_SYSTEM_PROMPT
+
+    return prompt
 
 
 def generate_answer(
@@ -135,20 +190,49 @@ USER QUESTION / ВОПРОС ПОЛЬЗОВАТЕЛЯ
 {question}
 """.strip()
 
-    response = client.models.generate_content(
-        model=DEFAULT_GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-        ),
+    try:
+        response = client.models.generate_content(
+            model=DEFAULT_GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+            ),
+        )
+    except Exception as exc:
+        raise GenerationError(
+            f"Gemini generation request failed: {exc}"
+        ) from exc
+
+    answer = (response.text or "").strip()
+
+    if answer:
+        return answer
+
+    block_reason = (
+        response.prompt_feedback.block_reason
+        if response.prompt_feedback is not None
+        else None
+    )
+    finish_reasons = [
+        candidate.finish_reason for candidate in response.candidates or []
+    ]
+
+    if block_reason is not None or any(
+        reason is not None and reason != types.FinishReason.STOP
+        for reason in finish_reasons
+    ):
+        raise GenerationError(
+            f"Gemini returned no answer "
+            f"(block_reason={block_reason}, "
+            f"finish_reasons={finish_reasons})"
+        )
+
+    logger.warning(
+        "Gemini returned an empty answer without a block reason, "
+        "responding with the not-found message"
     )
 
-    answer = response.text
-
-    if not answer:
-        return "Такой информации нет в имеющейся документации."
-
-    return answer.strip()
+    return NOT_FOUND_ANSWER
 
 
 def build_sources(chunks: list[Any]) -> list[Source]:
@@ -215,27 +299,51 @@ def ask(request: AskRequest):
 
     try:
         vector = embed_query(api_key, question)
+    except EmbeddingError as exc:
+        logger.exception("Query embedding failed")
+        raise HTTPException(
+            status_code=502,
+            detail="Embedding provider is unavailable",
+        ) from exc
+
+    try:
         chunks = search_qdrant(vector, request.top_k)
+    except RetrievalError as exc:
+        logger.exception("Document retrieval failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Document store is unavailable",
+        ) from exc
 
-        if not chunks:
-            return AskResponse(
-                answer="Not found in documentation.",
-                sources=[],
-            )
-
-        context = build_context(chunks)
-        answer = generate_answer(api_key, question, context)
-        sources = build_sources(chunks)
-
+    if not chunks:
         return AskResponse(
-            answer=answer,
-            sources=sources,
+            answer=NOT_FOUND_ANSWER,
+            sources=[],
         )
 
-    except HTTPException:
-        raise
-    except Exception as exc:
+    context = build_context(chunks)
+
+    if not context.strip():
+        logger.warning(
+            "Retrieved %s chunks without any text payload; "
+            "answering with the not-found message",
+            len(chunks),
+        )
+        return AskResponse(
+            answer=NOT_FOUND_ANSWER,
+            sources=build_sources(chunks),
+        )
+
+    try:
+        answer = generate_answer(api_key, question, context)
+    except GenerationError as exc:
+        logger.exception("Answer generation failed")
         raise HTTPException(
-            status_code=500,
-            detail=f"RAG request failed: {exc}",
+            status_code=502,
+            detail="Answer generation failed",
         ) from exc
+
+    return AskResponse(
+        answer=answer,
+        sources=build_sources(chunks),
+    )

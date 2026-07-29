@@ -30,7 +30,9 @@ def main():
         print()
         print("-" * 80)
         print(f"RANK     : {i}")
-        print(f"SCORE    : {point.score:.6f}")
+        score = f"{point.score:.6f}" if point.score is not None else "n/a"
+
+        print(f"SCORE    : {score}")
         print(f"FILE     : {payload.get('file_name')}")
         print(f"TYPE     : {payload.get('document_type')}")
         print(f"SECTION  : {payload.get('section')}")

@@ -507,6 +507,8 @@ class GeminiEmbedder(BaseEmbedder):
         vectors: list[list[float]] = []
 
         for idx, text in enumerate(texts, start=1):
+            last_error: Exception | None = None
+
             for attempt in range(5):
                 try:
                     response = self._genai.embed_content(
@@ -514,7 +516,14 @@ class GeminiEmbedder(BaseEmbedder):
                         content=text,
                         task_type="retrieval_document",
                     )
-                    vectors.append(response["embedding"])
+                    embedding = response.get("embedding")
+
+                    if not embedding:
+                        raise RuntimeError(
+                            f"Gemini returned no embedding for item {idx}/{len(texts)}"
+                        )
+
+                    vectors.append(embedding)
 
                     # Free tier safety throttle
                     time.sleep(0.75)
@@ -524,6 +533,7 @@ class GeminiEmbedder(BaseEmbedder):
                     message = str(exc)
 
                     if "429" in message or "RESOURCE_EXHAUSTED" in message or "quota" in message.lower():
+                        last_error = exc
                         wait_seconds = 15 * (attempt + 1)
                         logging.warning(
                             "Embedding quota hit at item %s/%s. Waiting %s seconds. Error: %s",
@@ -538,7 +548,9 @@ class GeminiEmbedder(BaseEmbedder):
                     raise
 
             else:
-                raise RuntimeError(f"Failed to embed text after retries at item {idx}/{len(texts)}")
+                raise RuntimeError(
+                    f"Failed to embed text after retries at item {idx}/{len(texts)}"
+                ) from last_error
 
         return vectors
 
@@ -572,11 +584,12 @@ class QdrantWriter:
         self.collection_name = collection_name
 
     def delete_collection_if_exists(self) -> None:
-        try:
-            self.client.delete_collection(collection_name=self.collection_name)
-            logging.info("Deleted Qdrant collection %r", self.collection_name)
-        except Exception as exc:
-            logging.debug("Delete collection %r (may not exist): %s", self.collection_name, exc)
+        if not self.client.collection_exists(collection_name=self.collection_name):
+            logging.info("Qdrant collection %r does not exist yet", self.collection_name)
+            return
+
+        self.client.delete_collection(collection_name=self.collection_name)
+        logging.info("Deleted Qdrant collection %r", self.collection_name)
 
     def ensure_collection(self, vector_size: int) -> None:
         collections = self.client.get_collections().collections
@@ -599,7 +612,17 @@ class QdrantWriter:
     def upsert(self, payload_chunks: Sequence[Chunk], vectors: Sequence[Sequence[float]], *, vector_size: int) -> None:
         if not payload_chunks:
             return
-        self.ensure_collection(vector_size=len(vectors[0]))
+        if len(vectors) != len(payload_chunks):
+            raise ValueError(
+                f"Embedding count mismatch: {len(vectors)} vectors "
+                f"for {len(payload_chunks)} chunks"
+            )
+        mismatched = [len(vector) for vector in vectors if len(vector) != vector_size]
+        if mismatched:
+            raise ValueError(
+                f"Embedding dimension mismatch: expected {vector_size}, got {sorted(set(mismatched))}"
+            )
+        self.ensure_collection(vector_size=vector_size)
         points = [
             PointStruct(id=chunk.id, vector=list(vector), payload={"text": chunk.text, **chunk.metadata})
             for chunk, vector in zip(payload_chunks, vectors, strict=True)
@@ -720,15 +743,21 @@ class IngestionPipeline:
 
         all_chunks: list[Chunk] = []
         doc_profiles: dict[str, dict[str, int | str]] = {}
+        failed_paths: list[Path] = []
         for path in paths:
-            segments, source, version = self._load_segments(path)
-            char_count = sum(len(t) for _, t in segments)
-
-            chunk_items_preview = self.chunker.split(segments)
+            try:
+                segments, source, version = self._load_segments(path)
+            except Exception:
+                logging.exception("Failed to extract document: %s", path)
+                failed_paths.append(path)
+                continue
 
             if not segments:
                 logging.warning("Skipping empty document: %s", path)
                 continue
+
+            char_count = sum(len(t) for _, t in segments)
+            chunk_items_preview = self.chunker.split(segments)
 
             chunks = self._build_chunks(path, segments, source, version)
             all_chunks.extend(chunks)
@@ -739,6 +768,13 @@ class IngestionPipeline:
                 "chars": char_count,
                 "chunks": len(chunk_items_preview),
             }
+
+        if failed_paths:
+            raise RuntimeError(
+                "Extraction failed for "
+                f"{len(failed_paths)}/{len(paths)} documents: "
+                + ", ".join(str(path) for path in failed_paths)
+            )
 
         if not all_chunks:
             logging.warning("No chunks generated.")
@@ -757,7 +793,13 @@ class IngestionPipeline:
                 for chunk in all_chunks
             ]
         )
-        vec_size = len(vectors[0]) if vectors else 0
+        if not vectors or not vectors[0]:
+            raise RuntimeError(
+                f"Embedder {self.embedder.model_label!r} returned no vectors "
+                f"for {len(all_chunks)} chunks"
+            )
+
+        vec_size = len(vectors[0])
 
         embedding_model_label = self.embedder.model_label
         counts_by_index: defaultdict[str, int] = defaultdict(int)
@@ -822,8 +864,8 @@ def build_embedder(
 
     try:
         return GeminiEmbedder(api_key=api_key, model_name=gemini_model)
-    except Exception as exc:
-        logging.error("Failed to initialize Gemini embedder: %s", exc)
+    except Exception:
+        logging.exception("Failed to initialize Gemini embedder")
         sys.exit(2)
 
 

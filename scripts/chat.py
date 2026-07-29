@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 
 from qdrant_client import QdrantClient
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_COLLECTION = "angioplus_documents"
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -48,11 +51,16 @@ def load_system_prompt() -> str:
     try:
         with open(SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as f:
             return f.read().strip()
-    except FileNotFoundError:
+    except OSError as exc:
+        logger.warning(
+            "Falling back to the built-in system prompt, %r could not be read: %s",
+            SYSTEM_PROMPT_PATH,
+            exc,
+        )
         return "Ты — технический ассистент поддержки AngioPlus Core. Отвечай строго на основе контекста."
 
 
-def generate_answer(api_key: str, question: str, context: str):
+def generate_answer(api_key: str, question: str, context: str) -> str:
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
@@ -78,7 +86,14 @@ USER QUESTION / ВОПРОС ПОЛЬЗОВАТЕЛЯ
     model = genai.GenerativeModel(DEFAULT_GEMINI_MODEL)
     response = model.generate_content(prompt)
 
-    return response.text
+    answer = (response.text or "").strip()
+
+    if not answer:
+        raise RuntimeError(
+            f"Gemini returned no answer (prompt_feedback={response.prompt_feedback})"
+        )
+
+    return answer
 
 
 def parse_args():
@@ -102,6 +117,8 @@ def resolve_question(args):
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+
     args = parse_args()
     question = resolve_question(args)
 
@@ -153,11 +170,12 @@ def main():
 
     for chunk in relevant_sources:
         p = chunk.payload or {}
+        score = f"{chunk.score:.3f}" if chunk.score is not None else "n/a"
         print(
             f"{p.get('file_name')} | "
             f"{p.get('section')} | "
             f"pages {p.get('page_start')}-{p.get('page_end')} | "
-            f"score {chunk.score:.3f}"
+            f"score {score}"
         )
 
 

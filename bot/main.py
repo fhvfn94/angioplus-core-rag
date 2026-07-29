@@ -7,7 +7,10 @@ import os
 
 import httpx
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import CommandStart
+from aiogram.types import ErrorEvent
+from google.genai import errors as genai_errors
 from services.stt import STTService
 from time import perf_counter
 import asyncio
@@ -40,6 +43,36 @@ if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set")
 
 
+class RagResponseError(RuntimeError):
+    """RAG API answered with a body the bot cannot use."""
+
+
+def is_quota_error(exc: BaseException) -> bool:
+    if isinstance(exc, genai_errors.APIError) and exc.code == 429:
+        return True
+
+    text = str(exc).lower()
+
+    return (
+        "429" in text
+        or "resource_exhausted" in text
+        or "quota" in text
+    )
+
+
+async def reply_status(status_message: types.Message, text: str) -> None:
+    """Update the status message, falling back to a new message."""
+    try:
+        await status_message.edit_text(text)
+    except TelegramAPIError:
+        logger.exception("Failed to edit status message")
+
+        try:
+            await status_message.answer(text)
+        except TelegramAPIError:
+            logger.exception("Failed to deliver status message")
+
+
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 stt_service = STTService(
@@ -65,11 +98,11 @@ def format_sources(sources: list[dict]) -> str:
     lines = ["\n\nИсточники:"]
 
     for source in sources:
-        file_name = source.get("file_name", "")
-        section = source.get("section", "")
-        page_start = source.get("page_start", "")
-        page_end = source.get("page_end", "")
-        score = source.get("score", "")
+        file_name = source.get("file_name") or ""
+        section = source.get("section") or ""
+        page_start = source.get("page_start") or ""
+        page_end = source.get("page_end") or ""
+        score = source.get("score") or ""
 
         if file_name.endswith(".xlsx"):
             lines.append(
@@ -97,7 +130,35 @@ async def ask_rag(question: str) -> dict:
             },
         )
         response.raise_for_status()
-        return response.json()
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RagResponseError(
+                "RAG API returned a non-JSON body"
+            ) from exc
+
+    if not isinstance(data, dict):
+        raise RagResponseError(
+            f"RAG API returned {type(data).__name__} instead of an object"
+        )
+
+    answer = data.get("answer")
+
+    if not isinstance(answer, str) or not answer.strip():
+        raise RagResponseError(
+            "RAG API response has no usable 'answer' field"
+        )
+
+    sources = data.get("sources", [])
+
+    if not isinstance(sources, list):
+        raise RagResponseError(
+            f"RAG API returned 'sources' as "
+            f"{type(sources).__name__} instead of a list"
+        )
+
+    return data
 
 
 async def send_rag_answer(
@@ -119,25 +180,33 @@ async def send_rag_answer(
         data = await ask_rag(question)
 
     except httpx.HTTPStatusError as exc:
-        logger.exception("RAG API returned an HTTP error")
-
-        status_code = exc.response.status_code
+        logger.exception(
+            "RAG API returned HTTP %s: %s",
+            exc.response.status_code,
+            exc.response.text[:500],
+        )
         await message.answer(
-            f"RAG API вернул ошибку HTTP {status_code}."
+            f"RAG API вернул ошибку HTTP {exc.response.status_code}. "
+            "Попробуй повторить запрос позже."
         )
         return
 
-    except Exception as exc:
+    except httpx.TimeoutException:
+        logger.exception("RAG API request timed out")
+        await message.answer(
+            "RAG API не ответил вовремя. Попробуй повторить запрос."
+        )
+        return
+
+    except (httpx.HTTPError, RagResponseError):
         logger.exception("RAG API request failed")
         await message.answer(
-            f"Ошибка при обращении к RAG API: {exc}"
+            "Не удалось получить ответ от RAG API. "
+            "Попробуй повторить запрос позже."
         )
         return
 
-    answer = data.get(
-        "answer",
-        "Информация не найдена в документации.",
-    )
+    answer = data["answer"]
     sources = data.get("sources", [])
 
     final_text = answer + format_sources(sources)
@@ -189,22 +258,18 @@ async def handle_voice(message: types.Message) -> None:
     except Exception as exc:
         logger.exception("Voice transcription failed")
 
-        error_text = str(exc).lower()
-
-        if (
-            "429" in error_text
-            or "resource_exhausted" in error_text
-            or "quota" in error_text
-        ):
-            await status_message.edit_text(
+        if is_quota_error(exc):
+            await reply_status(
+                status_message,
                 "Не удалось распознать голосовое сообщение: "
                 "превышен лимит Gemini API. "
-                "Попробуй немного позже."
+                "Попробуй немного позже.",
             )
         else:
-            await status_message.edit_text(
+            await reply_status(
+                status_message,
                 "Не удалось распознать голосовое сообщение. "
-                "Попробуй записать его ещё раз."
+                "Попробуй записать его ещё раз.",
             )
 
         return
@@ -215,8 +280,9 @@ async def handle_voice(message: types.Message) -> None:
         transcription,
     )
 
-    await status_message.edit_text(
-        f"📝 Распознано:\n{transcription}"
+    await reply_status(
+        status_message,
+        f"📝 Распознано:\n{transcription}",
     )
 
     rag_started = perf_counter()
@@ -264,9 +330,34 @@ async def handle_unsupported_message(
     )
 
 
+@dp.error()
+async def handle_unexpected_error(event: ErrorEvent) -> None:
+    logger.exception(
+        "Unhandled error while processing update %s",
+        event.update.update_id,
+        exc_info=event.exception,
+    )
+
+    message = event.update.message
+
+    if message is None:
+        return
+
+    try:
+        await message.answer(
+            "Внутренняя ошибка бота. Попробуй повторить запрос позже."
+        )
+    except TelegramAPIError:
+        logger.exception("Failed to report the internal error to the user")
+
+
 async def main() -> None:
     logger.info("Starting Telegram bot")
-    await dp.start_polling(bot)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":

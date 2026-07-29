@@ -4,52 +4,25 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from itertools import islice
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qdrant_client import QdrantClient
 
-DEFAULT_COLLECTION = "angioplus_documents"
+from rag_common import (
+    DEFAULT_COLLECTION,
+    DEFAULT_GEMINI_EMBEDDING_MODEL,
+    DEFAULT_GEMINI_MODEL,
+    build_context,
+    build_context_block,
+    iter_unique_chunks,
+    load_system_prompt,
+    search_qdrant,
+)
+from rag_common.gemini import embed_query
+
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-DEFAULT_GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-001"
-DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
-SYSTEM_PROMPT_PATH = os.getenv("SYSTEM_PROMPT_PATH", "app/prompts/system_prompt.md")
-
-
-def embed_query(api_key: str, question: str, model_name: str) -> list[float]:
-    import google.generativeai as genai
-
-    genai.configure(api_key=api_key)
-    response = genai.embed_content(
-        model=model_name,
-        content=question,
-        task_type="retrieval_query",
-    )
-    return response["embedding"]
-
-
-def search_qdrant(client: QdrantClient, collection: str, vector: list[float], limit: int):
-    response = client.query_points(
-        collection_name=collection,
-        query=vector,
-        limit=limit,
-        with_payload=True,
-    )
-    return list(response.points)
-
-
-def build_context(chunks) -> str:
-    parts = []
-    for i, chunk in enumerate(chunks, 1):
-        payload = chunk.payload or {}
-        text = payload.get("text", "")
-        parts.append(f"[Chunk {i}]\n{text}")
-    return "\n\n".join(parts)
-
-def load_system_prompt() -> str:
-    try:
-        with open(SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return "Ты — технический ассистент поддержки AngioPlus Core. Отвечай строго на основе контекста."
 
 
 def generate_answer(api_key: str, question: str, context: str):
@@ -59,21 +32,7 @@ def generate_answer(api_key: str, question: str, context: str):
 
     system_prompt = load_system_prompt()
 
-    prompt = f"""
-{system_prompt}
-
---------------------
-RETRIEVED CONTEXT / НАЙДЕННЫЙ КОНТЕКСТ
---------------------
-
-{context}
-
---------------------
-USER QUESTION / ВОПРОС ПОЛЬЗОВАТЕЛЯ
---------------------
-
-{question}
-"""
+    prompt = f"{system_prompt}\n\n{build_context_block(context, question)}"
 
     model = genai.GenerativeModel(DEFAULT_GEMINI_MODEL)
     response = model.generate_content(prompt)
@@ -130,26 +89,7 @@ def main():
 
     print("\n=== SOURCES ===\n")
 
-    seen = set()
-    relevant_sources = []
-
-    for chunk in chunks:
-        p = chunk.payload or {}
-        key = (
-            p.get("file_name"),
-            p.get("section"),
-            p.get("page_start"),
-            p.get("page_end"),
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        relevant_sources.append(chunk)
-
-        if len(relevant_sources) >= 3:
-            break
+    relevant_sources = list(islice(iter_unique_chunks(chunks), 3))
 
     for chunk in relevant_sources:
         p = chunk.payload or {}

@@ -10,45 +10,16 @@ import os
 import sys
 import textwrap
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from qdrant_client import QdrantClient
 
+from rag_common import DEFAULT_COLLECTION, DEFAULT_GEMINI_EMBEDDING_MODEL, search_qdrant
+from rag_common.gemini import embed_query
+
 # Keep defaults aligned with scripts/ingest_documents.py
-DEFAULT_COLLECTION = "angioplus_documents"
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-DEFAULT_GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-001"
 PREVIEW_MAX_CHARS = 400
-
-
-def embed_query(api_key: str, question: str, model_name: str) -> list[float]:
-    try:
-        import google.generativeai as genai
-    except ImportError as exc:
-        raise RuntimeError("Missing dependency: google-generativeai") from exc
-
-    genai.configure(api_key=api_key)
-    response = genai.embed_content(
-        model=model_name,
-        content=question,
-        task_type="retrieval_query",
-    )
-    return response["embedding"]
-
-
-def search_qdrant(
-    *,
-    client: QdrantClient,
-    collection: str,
-    query_vector: list[float],
-    limit: int,
-) -> list:
-    # qdrant-client 1.10+ exposes query_points; legacy .search() was removed in 1.17.x
-    response = client.query_points(
-        collection_name=collection,
-        query=query_vector,
-        limit=limit,
-        with_payload=True,
-    )
-    return list(response.points)
 
 
 def format_preview(text: str, max_chars: int = PREVIEW_MAX_CHARS) -> str:
@@ -126,7 +97,7 @@ def main() -> None:
         hits = search_qdrant(
             client=client,
             collection=args.collection,
-            query_vector=vector,
+            vector=vector,
             limit=args.top_k,
         )
     except Exception as exc:

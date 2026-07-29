@@ -10,14 +10,19 @@ from google.genai import types
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
 
-DEFAULT_COLLECTION = "angioplus_documents"
-DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
-DEFAULT_GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
-DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
-SYSTEM_PROMPT_PATH = os.getenv(
-    "SYSTEM_PROMPT_PATH",
-    "app/prompts/system_prompt.md",
+from rag_common import (
+    DEFAULT_COLLECTION,
+    DEFAULT_GEMINI_MODEL,
+    build_context,
+    build_context_block,
+    iter_unique_chunks,
+    load_system_prompt,
 )
+from rag_common.retrieval import search_qdrant as _search_qdrant
+
+DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
+# New google-genai SDK expects the bare model id (no "models/" prefix).
+DEFAULT_GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
 
 app = FastAPI(title="AngioPlus Core RAG Assistant")
 
@@ -80,37 +85,7 @@ def embed_query(api_key: str, question: str) -> list[float]:
 
 def search_qdrant(vector: list[float], top_k: int):
     client = QdrantClient(url=DEFAULT_QDRANT_URL)
-
-    response = client.query_points(
-        collection_name=DEFAULT_COLLECTION,
-        query=vector,
-        limit=top_k,
-        with_payload=True,
-    )
-
-    return list(response.points)
-
-
-def build_context(chunks: list[Any]) -> str:
-    parts = []
-
-    for i, chunk in enumerate(chunks, 1):
-        payload = chunk.payload or {}
-        text = payload.get("text", "")
-        parts.append(f"[Chunk {i}]\n{text}")
-
-    return "\n\n".join(parts)
-
-
-def load_system_prompt() -> str:
-    try:
-        with open(SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as file:
-            return file.read().strip()
-    except FileNotFoundError:
-        return (
-            "Ты — технический ассистент поддержки AngioPlus Core. "
-            "Отвечай строго на основе контекста."
-        )
+    return _search_qdrant(client, DEFAULT_COLLECTION, vector, top_k)
 
 
 def generate_answer(
@@ -121,19 +96,7 @@ def generate_answer(
     client = create_gemini_client(api_key)
     system_prompt = load_system_prompt()
 
-    prompt = f"""
---------------------
-RETRIEVED CONTEXT / НАЙДЕННЫЙ КОНТЕКСТ
---------------------
-
-{context}
-
---------------------
-USER QUESTION / ВОПРОС ПОЛЬЗОВАТЕЛЯ
---------------------
-
-{question}
-""".strip()
+    prompt = build_context_block(context, question)
 
     response = client.models.generate_content(
         model=DEFAULT_GEMINI_MODEL,
@@ -152,7 +115,6 @@ USER QUESTION / ВОПРОС ПОЛЬЗОВАТЕЛЯ
 
 
 def build_sources(chunks: list[Any]) -> list[Source]:
-    seen = set()
     sources: list[Source] = []
 
     relevant_chunks = [
@@ -164,20 +126,8 @@ def build_sources(chunks: list[Any]) -> list[Source]:
     if not relevant_chunks and chunks:
         relevant_chunks = [chunks[0]]
 
-    for chunk in relevant_chunks:
+    for chunk in iter_unique_chunks(relevant_chunks):
         payload = chunk.payload or {}
-
-        key = (
-            payload.get("file_name"),
-            payload.get("section"),
-            payload.get("page_start"),
-            payload.get("page_end"),
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
 
         sources.append(
             Source(

@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import hmac
+import logging
 import os
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from google import genai
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
 
 DEFAULT_COLLECTION = "angioplus_documents"
@@ -18,13 +20,34 @@ SYSTEM_PROMPT_PATH = os.getenv(
     "SYSTEM_PROMPT_PATH",
     "app/prompts/system_prompt.md",
 )
+MAX_QUESTION_LENGTH = 2000
+MAX_TOP_K = 20
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AngioPlus Core RAG Assistant")
 
 
+def require_api_key(x_api_key: str = Header(default="")) -> None:
+    expected = os.getenv("RAG_API_KEY", "").strip()
+
+    if not expected:
+        logger.error("RAG_API_KEY is not set, refusing to serve /ask")
+        raise HTTPException(
+            status_code=503,
+            detail="Service is not configured",
+        )
+
+    if not hmac.compare_digest(x_api_key.strip(), expected):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key",
+        )
+
+
 class AskRequest(BaseModel):
-    question: str
-    top_k: int = 5
+    question: str = Field(min_length=1, max_length=MAX_QUESTION_LENGTH)
+    top_k: int = Field(default=5, ge=1, le=MAX_TOP_K)
 
 
 class Source(BaseModel):
@@ -79,7 +102,10 @@ def embed_query(api_key: str, question: str) -> list[float]:
 
 
 def search_qdrant(vector: list[float], top_k: int):
-    client = QdrantClient(url=DEFAULT_QDRANT_URL)
+    client = QdrantClient(
+        url=DEFAULT_QDRANT_URL,
+        api_key=os.getenv("QDRANT_API_KEY") or None,
+    )
 
     response = client.query_points(
         collection_name=DEFAULT_COLLECTION,
@@ -201,7 +227,11 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/ask", response_model=AskResponse)
+@app.post(
+    "/ask",
+    response_model=AskResponse,
+    dependencies=[Depends(require_api_key)],
+)
 def ask(request: AskRequest):
     question = request.question.strip()
 
@@ -235,7 +265,8 @@ def ask(request: AskRequest):
     except HTTPException:
         raise
     except Exception as exc:
+        logger.exception("RAG request failed")
         raise HTTPException(
             status_code=500,
-            detail=f"RAG request failed: {exc}",
+            detail="RAG request failed",
         ) from exc

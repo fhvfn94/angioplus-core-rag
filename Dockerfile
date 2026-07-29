@@ -9,6 +9,9 @@ ENV PYTHONUNBUFFERED=1 \
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
+
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
 # Development image.
 # Project source is mounted by docker-compose via:
 # volumes:

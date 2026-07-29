@@ -15,6 +15,7 @@ import asyncio
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 RAG_API_URL = os.getenv("RAG_API_URL", "http://rag:8000/ask").strip()
+RAG_API_KEY = os.getenv("RAG_API_KEY", "").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_AUDIO_MODEL = os.getenv(
@@ -24,6 +25,20 @@ GEMINI_AUDIO_MODEL = os.getenv(
 
 MAX_VOICE_DURATION_SECONDS = int(
     os.getenv("MAX_VOICE_DURATION_SECONDS", "120")
+)
+MAX_QUESTION_LENGTH = 2000
+
+
+def parse_allowed_user_ids(raw: str) -> frozenset[int]:
+    return frozenset(
+        int(part)
+        for part in raw.replace(";", ",").split(",")
+        if part.strip()
+    )
+
+
+ALLOWED_USER_IDS = parse_allowed_user_ids(
+    os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
 )
 
 logging.basicConfig(
@@ -39,6 +54,15 @@ if not TELEGRAM_BOT_TOKEN:
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set")
 
+if not RAG_API_KEY:
+    raise RuntimeError("RAG_API_KEY is not set")
+
+if not ALLOWED_USER_IDS:
+    logger.warning(
+        "TELEGRAM_ALLOWED_USER_IDS is empty: "
+        "any Telegram user can query internal documentation"
+    )
+
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
@@ -50,8 +74,32 @@ stt_service = STTService(
 
 
 
+def is_allowed(message: types.Message) -> bool:
+    if not ALLOWED_USER_IDS:
+        return True
+
+    user = message.from_user
+
+    return user is not None and user.id in ALLOWED_USER_IDS
+
+
+async def reject_unauthorized(message: types.Message) -> None:
+    logger.warning(
+        "Rejected message from unauthorized user_id=%s",
+        message.from_user.id if message.from_user else None,
+    )
+    await message.answer(
+        "Доступ к ассистенту ограничен. "
+        "Обратись к администратору поддержки."
+    )
+
+
 @dp.message(CommandStart())
 async def start(message: types.Message) -> None:
+    if not is_allowed(message):
+        await reject_unauthorized(message)
+        return
+
     await message.answer(
         "Привет. Я MVP ассистент поддержки AngioPlus Core.\n\n"
         "Задай вопрос текстом или отправь голосовое сообщение."
@@ -91,6 +139,7 @@ async def ask_rag(question: str) -> dict:
     async with httpx.AsyncClient(timeout=90) as client:
         response = await client.post(
             RAG_API_URL,
+            headers={"X-API-Key": RAG_API_KEY},
             json={
                 "question": question,
                 "top_k": 5,
@@ -113,6 +162,13 @@ async def send_rag_answer(
         )
         return
 
+    if len(question) > MAX_QUESTION_LENGTH:
+        await message.answer(
+            "Вопрос слишком длинный. "
+            f"Максимальная длина: {MAX_QUESTION_LENGTH} символов."
+        )
+        return
+
     await message.answer("Секунду, проверяю базу знаний...")
 
     try:
@@ -127,10 +183,11 @@ async def send_rag_answer(
         )
         return
 
-    except Exception as exc:
+    except Exception:
         logger.exception("RAG API request failed")
         await message.answer(
-            f"Ошибка при обращении к RAG API: {exc}"
+            "Не удалось получить ответ от RAG API. "
+            "Попробуй ещё раз позже."
         )
         return
 
@@ -153,6 +210,10 @@ async def send_rag_answer(
 
 @dp.message(F.voice)
 async def handle_voice(message: types.Message) -> None:
+    if not is_allowed(message):
+        await reject_unauthorized(message)
+        return
+
     total_started = perf_counter()
 
 
@@ -210,9 +271,9 @@ async def handle_voice(message: types.Message) -> None:
         return
 
     logger.info(
-        "Voice message transcribed: user_id=%s, text=%r",
+        "Voice message transcribed: user_id=%s, chars=%d",
         message.from_user.id if message.from_user else None,
-        transcription,
+        len(transcription),
     )
 
     await status_message.edit_text(
@@ -241,6 +302,10 @@ async def handle_voice(message: types.Message) -> None:
 async def handle_text_question(
     message: types.Message,
 ) -> None:
+    if not is_allowed(message):
+        await reject_unauthorized(message)
+        return
+
     question = (message.text or "").strip()
 
     if not question:
@@ -259,6 +324,10 @@ async def handle_text_question(
 async def handle_unsupported_message(
     message: types.Message,
 ) -> None:
+    if not is_allowed(message):
+        await reject_unauthorized(message)
+        return
+
     await message.answer(
         "Пришли вопрос текстом или голосовым сообщением."
     )

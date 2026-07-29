@@ -9,7 +9,6 @@ import pytest
 
 from scripts import ingest_documents as ingest
 
-
 # ---------------------------------------------------------------- extractors
 
 
@@ -278,14 +277,12 @@ def test_estimate_tokens_is_at_least_one():
 
 
 def test_is_toc_like_detects_dotted_lines():
-    toc = "\n".join(
-        [
-            "1 Введение ....... 1",
-            "2 Установка ....... 2",
-            "3 Настройка ....... 3",
-            "4 Работа",
-            "5 Сервис",
-        ]
+    toc = (
+        "1 Введение ....... 1\n"
+        "2 Установка ....... 2\n"
+        "3 Настройка ....... 3\n"
+        "4 Работа\n"
+        "5 Сервис"
     )
 
     assert ingest.SemanticChunker._is_toc_like(toc) is True

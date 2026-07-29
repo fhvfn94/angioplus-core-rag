@@ -26,10 +26,17 @@ class FakeGeminiClient:
         self.models = FakeModels(text=text, error=error)
 
 
+DOWNLOADED_FILE = object()
+
+
 class FakeBot:
     """Mimics ``aiogram.Bot.download`` writing into the given destination."""
 
-    def __init__(self, payload: bytes | None = b"audio-bytes", result=object()):
+    def __init__(
+        self,
+        payload: bytes | None = b"audio-bytes",
+        result=DOWNLOADED_FILE,
+    ):
         self.payload = payload
         self.result = result
         self.calls: list[dict] = []

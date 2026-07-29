@@ -128,14 +128,14 @@ def test_parse_args_defaults(monkeypatch):
 
 
 def _args(**overrides) -> argparse.Namespace:
-    defaults = dict(
-        question="вопрос",
-        question_flag=None,
-        top_k=3,
-        qdrant_url="http://localhost:6333",
-        collection="col",
-        gemini_api_key="key",
-    )
+    defaults = {
+        "question": "вопрос",
+        "question_flag": None,
+        "top_k": 3,
+        "qdrant_url": "http://localhost:6333",
+        "collection": "col",
+        "gemini_api_key": "key",
+    }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
 

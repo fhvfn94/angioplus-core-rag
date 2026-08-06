@@ -225,7 +225,7 @@ app = FastAPI(title="AngioPlus Core RAG Assistant", lifespan=lifespan)
 
 class AskRequest(BaseModel):
     question: str
-    top_k: int = 5
+    top_k: int = 10
     conversation_id: str | None = None
     user_id: str | None = None
 
@@ -323,7 +323,40 @@ def build_context(chunks: list[Any]) -> str:
     for i, chunk in enumerate(chunks, 1):
         payload = chunk.payload or {}
         text = payload.get("text", "")
-        parts.append(f"[Chunk {i}]\n{text}")
+        source = payload.get("source", "UNKNOWN")
+        file_name = payload.get("file_name", "UNKNOWN")
+        section = payload.get("section") or payload.get("section_title") or ""
+        page_start = payload.get("page_start")
+        page_end = payload.get("page_end")
+        sheet_name = payload.get("sheet_name")
+        row_number = payload.get("row_number")
+
+        metadata_lines = [
+            f"Source type: {source}",
+            f"File: {file_name}",
+        ]
+
+        if page_start is not None:
+            if page_end is not None and page_end != page_start:
+                metadata_lines.append(f"Pages: {page_start}-{page_end}")
+            else:
+                metadata_lines.append(f"Page: {page_start}")
+
+        if section:
+            metadata_lines.append(f"Section: {section}")
+
+        if sheet_name:
+            metadata_lines.append(f"Sheet: {sheet_name}")
+
+        if row_number is not None:
+            metadata_lines.append(f"Row: {row_number}")
+
+        metadata = "\n".join(metadata_lines)
+        parts.append(
+            f"[Chunk {i}]\n"
+            f"{metadata}\n"
+            f"Content:\n{text}"
+        )
 
     return "\n\n".join(parts)
 
@@ -471,6 +504,47 @@ def contains_secret(text: str) -> bool:
         if pattern.search(text):
             return True
     return False
+
+
+
+def extract_used_chunks(
+    answer: str,
+    chunks: list[Any],
+) -> tuple[str, list[Any], list[int]]:
+    """Remove [[USED_CHUNKS: ...]] and return the cited retrieval chunks."""
+    pattern = re.compile(
+        r"\n?\s*\[\[USED_CHUNKS:\s*([0-9,\s]+)\]\]\s*$",
+        re.IGNORECASE,
+    )
+
+    match = pattern.search(answer or "")
+    if not match:
+        return (answer or "").strip(), [], []
+
+    clean_answer = pattern.sub("", answer).strip()
+
+    numbers: list[int] = []
+    seen: set[int] = set()
+
+    for raw in match.group(1).split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+
+        try:
+            number = int(raw)
+        except ValueError:
+            continue
+
+        if number < 1 or number > len(chunks) or number in seen:
+            continue
+
+        seen.add(number)
+        numbers.append(number)
+
+    cited_chunks = [chunks[number - 1] for number in numbers]
+    return clean_answer, cited_chunks, numbers
+
 
 
 def build_sources(chunks: list[Any]) -> list[Source]:
@@ -753,6 +827,9 @@ def ask(request: AskRequest):
                         "gate_seconds": round(gate_seconds, 4),
                         "gate_result": "error",
                         "gate_error": True,
+                        "llm_error_type": exc.error_type.value,
+                        "llm_status_code": exc.status_code,
+                        "llm_error_message": exc.message,
                         "secret_request_blocked": False,
                         "secret_filter_triggered": False,
                         "context_enabled": bool(context_enabled),
@@ -811,7 +888,7 @@ def ask(request: AskRequest):
                 )
             return AskResponse(
                 answer=NOT_FOUND,
-                sources=sources,
+                sources=[],
             )
 
         # 3) Main generation using sanitized context only.
@@ -867,6 +944,15 @@ def ask(request: AskRequest):
             raise
         generation_seconds = perf_counter() - t_start
 
+        # Parse and remove the internal chunk citation marker.
+        answer, cited_chunks, cited_chunk_numbers = extract_used_chunks(
+            answer,
+            chunks,
+        )
+
+        if cited_chunks:
+            sources = build_sources(cited_chunks)
+
         # 4) Output secret filter (defence-in-depth after sanitized generation).
         secret_filter_triggered = contains_secret(answer)
         if secret_filter_triggered:
@@ -894,6 +980,8 @@ def ask(request: AskRequest):
                 "gate_seconds": round(gate_seconds, 4),
                 "gate_result": True,
                 "gate_error": False,
+                "cited_chunk_numbers": cited_chunk_numbers,
+                "citation_marker_found": bool(cited_chunk_numbers),
                 "secret_request_blocked": False,
                 "secret_filter_triggered": bool(secret_filter_triggered),
                 "context_enabled": bool(context_enabled),

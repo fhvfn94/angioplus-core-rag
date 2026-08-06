@@ -115,7 +115,7 @@ async def ask_rag(
     )
     payload = {
         "question": question,
-        "top_k": 5,
+        "top_k": 10,
     }
     if conversation_id:
         payload["conversation_id"] = conversation_id

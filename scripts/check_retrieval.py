@@ -17,7 +17,7 @@ def main():
     print(QUESTION)
     print("=" * 80)
 
-    vector = rag.embed_query(api_key, QUESTION)
+    vector = rag.embed_query(QUESTION)
     results = rag.search_qdrant(vector, top_k=TOP_K)
 
     if not results:

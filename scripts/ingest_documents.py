@@ -16,11 +16,14 @@ from typing import Iterable, Sequence
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
+from app.embeddings.sentence_transformer import SentenceTransformerEmbedder
+
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".xlsx"}
 DEFAULT_COLLECTION = "angioplus_documents"
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 # Gemini API (AI Studio): prefer gemini-embedding-001; legacy text-embedding-004 may 404 on embedContent.
 DEFAULT_GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-001"
+DEFAULT_EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "gemini")
 
 
 @dataclass(slots=True)
@@ -485,16 +488,22 @@ class BaseEmbedder:
 
 
 class GeminiEmbedder(BaseEmbedder):
-    def __init__(self, api_key: str, model_name: str = DEFAULT_GEMINI_EMBEDDING_MODEL) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str = DEFAULT_GEMINI_EMBEDDING_MODEL,
+    ) -> None:
         if not api_key:
             raise ValueError("Gemini API key is required")
-        try:
-            import google.generativeai as genai
-        except ImportError as exc:
-            raise RuntimeError("Missing dependency: google-generativeai") from exc
 
-        genai.configure(api_key=api_key)
-        self._genai = genai
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as exc:
+            raise RuntimeError("Missing dependency: google-genai") from exc
+
+        self._client = genai.Client(api_key=api_key)
+        self._types = types
         self._model_name = model_name
 
     @property
@@ -509,12 +518,23 @@ class GeminiEmbedder(BaseEmbedder):
         for idx, text in enumerate(texts, start=1):
             for attempt in range(5):
                 try:
-                    response = self._genai.embed_content(
+                    response = self._client.models.embed_content(
                         model=self._model_name,
-                        content=text,
-                        task_type="retrieval_document",
+                        contents=text,
+                        config=self._types.EmbedContentConfig(
+                            task_type="RETRIEVAL_DOCUMENT",
+                        ),
                     )
-                    vectors.append(response["embedding"])
+
+                    if not response.embeddings:
+                        raise RuntimeError("Gemini returned no embeddings")
+
+                    embedding = response.embeddings[0]
+
+                    if not embedding.values:
+                        raise RuntimeError("Gemini returned an empty embedding")
+
+                    vectors.append(list(embedding.values))
 
                     # Free tier safety throttle
                     time.sleep(0.75)
@@ -523,8 +543,13 @@ class GeminiEmbedder(BaseEmbedder):
                 except Exception as exc:
                     message = str(exc)
 
-                    if "429" in message or "RESOURCE_EXHAUSTED" in message or "quota" in message.lower():
+                    if (
+                        "429" in message
+                        or "RESOURCE_EXHAUSTED" in message
+                        or "quota" in message.lower()
+                    ):
                         wait_seconds = 15 * (attempt + 1)
+
                         logging.warning(
                             "Embedding quota hit at item %s/%s. Waiting %s seconds. Error: %s",
                             idx,
@@ -532,16 +557,18 @@ class GeminiEmbedder(BaseEmbedder):
                             wait_seconds,
                             exc,
                         )
+
                         time.sleep(wait_seconds)
                         continue
 
                     raise
 
             else:
-                raise RuntimeError(f"Failed to embed text after retries at item {idx}/{len(texts)}")
+                raise RuntimeError(
+                    f"Failed to embed text after retries at item {idx}/{len(texts)}"
+                )
 
         return vectors
-
 
 class HashEmbedder(BaseEmbedder):
     def __init__(self, dimension: int = 256) -> None:
@@ -564,6 +591,20 @@ class HashEmbedder(BaseEmbedder):
                         break
             vectors.append(vec)
         return vectors
+
+
+class LocalSentenceTransformerEmbedder(BaseEmbedder):
+    """Adapter exposing the shared SentenceTransformerEmbedder via BaseEmbedder."""
+
+    def __init__(self, inner: SentenceTransformerEmbedder) -> None:
+        self._inner = inner
+
+    @property
+    def model_label(self) -> str:
+        return self._inner.model_label
+
+    def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
+        return self._inner.embed_documents(list(texts))
 
 
 class QdrantWriter:
@@ -805,6 +846,7 @@ class IngestionPipeline:
 def build_embedder(
     *,
     debug_hash_embeddings: bool,
+    embedding_provider: str,
     gemini_api_key: str | None,
     gemini_model: str,
 ) -> BaseEmbedder:
@@ -812,11 +854,30 @@ def build_embedder(
         logging.warning("Using HashEmbedder (debug only); not suitable for real retrieval.")
         return HashEmbedder()
 
+    provider = (embedding_provider or os.getenv("EMBEDDING_PROVIDER") or DEFAULT_EMBEDDING_PROVIDER).strip().lower()
+
+    if provider == "sentence_transformers":
+        logging.info("Using SentenceTransformerEmbedder (local) for document embeddings.")
+        try:
+            inner = SentenceTransformerEmbedder()
+        except RuntimeError as exc:
+            logging.error("Failed to initialize SentenceTransformerEmbedder: %s", exc)
+            sys.exit(2)
+        return LocalSentenceTransformerEmbedder(inner)
+
+    if provider != "gemini":
+        logging.error(
+            "Unknown embedding provider %r. Supported: gemini, sentence_transformers.",
+            provider,
+        )
+        sys.exit(2)
+
     api_key = (gemini_api_key or os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
         logging.error(
             "Gemini API key is required for ingestion. Set GEMINI_API_KEY or pass --gemini-api-key. "
-            "For local debugging only, use --debug-hash-embeddings.",
+            "For local debugging only, use --debug-hash-embeddings. "
+            "For local embeddings, set EMBEDDING_PROVIDER=sentence_transformers.",
         )
         sys.exit(2)
 
@@ -846,13 +907,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--debug-hash-embeddings",
         action="store_true",
-        help="Use deterministic hash vectors (demo/debug only). Real ingestion requires Gemini.",
+        help="Use deterministic hash vectors for demo/debug only.",
     )
     parser.add_argument("--gemini-api-key", default=os.getenv("GEMINI_API_KEY"), help="Gemini API key.")
     parser.add_argument(
         "--gemini-embedding-model",
         default=os.getenv("GEMINI_EMBEDDING_MODEL", DEFAULT_GEMINI_EMBEDDING_MODEL),
         help="Gemini embedding model id (e.g. models/gemini-embedding-001).",
+    )
+    parser.add_argument(
+        "--embedding-provider",
+        default=os.getenv("EMBEDDING_PROVIDER", DEFAULT_EMBEDDING_PROVIDER),
+        help="Embedding provider: gemini or sentence_transformers.",
     )
     parser.add_argument(
         "--recursive",
@@ -869,6 +935,7 @@ def main() -> None:
 
     embedder = build_embedder(
         debug_hash_embeddings=args.debug_hash_embeddings,
+        embedding_provider=args.embedding_provider,
         gemini_api_key=args.gemini_api_key,
         gemini_model=args.gemini_embedding_model,
     )

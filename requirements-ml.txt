@@ -1,0 +1,7 @@
+# Local ML dependencies for rag (only). CPU-only torch is installed
+# separately in a dedicated layer (not listed here) and pinned via
+# requirements-constraints.txt so that sentence-transformers cannot
+# replace it with a CUDA build.
+sentence-transformers==4.1.0
+transformers==4.57.6
+numpy>=1.26,<3

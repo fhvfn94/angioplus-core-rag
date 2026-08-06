@@ -1,0 +1,5 @@
+# Telegram bot + voice/STT only. No torch, sentence-transformers,
+# transformers, qdrant-client, openai, or document readers.
+aiogram>=3.4
+httpx>=0.27
+google-genai

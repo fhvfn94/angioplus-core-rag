@@ -1,0 +1,3 @@
+# Pin the local CPU-only torch so that installing sentence-transformers
+# / transformers does NOT replace it with a CUDA build.
+torch==2.13.0+cpu

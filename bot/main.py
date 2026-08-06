@@ -33,6 +33,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _read_rag_timeout() -> int:
+    raw = os.getenv("RAG_TIMEOUT_SECONDS", "180")
+    try:
+        value = int(raw)
+        if value > 0:
+            return value
+        raise ValueError(f"RAG_TIMEOUT_SECONDS must be positive, got {value}")
+    except (TypeError, ValueError):
+        logger.warning("Invalid RAG_TIMEOUT_SECONDS=%r, using default 180", raw)
+        return 180
+
+
+RAG_TIMEOUT_SECONDS = _read_rag_timeout()
+
+
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
@@ -87,17 +102,49 @@ def format_sources(sources: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
-async def ask_rag(question: str) -> dict:
-    async with httpx.AsyncClient(timeout=90) as client:
+async def ask_rag(
+    question: str,
+    conversation_id: str | None = None,
+    user_id: str | None = None,
+) -> dict:
+    timeout = httpx.Timeout(
+        connect=10.0,
+        read=float(RAG_TIMEOUT_SECONDS),
+        write=30.0,
+        pool=10.0,
+    )
+    payload = {
+        "question": question,
+        "top_k": 5,
+    }
+    if conversation_id:
+        payload["conversation_id"] = conversation_id
+    if user_id:
+        payload["user_id"] = user_id
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
             RAG_API_URL,
-            json={
-                "question": question,
-                "top_k": 5,
-            },
+            json=payload,
         )
         response.raise_for_status()
         return response.json()
+
+
+def _identity(message: types.Message) -> tuple[str, str]:
+    """Return (conversation_id, user_id) safely.
+
+    conversation_id is the Telegram chat id; user_id is the sender's Telegram
+    id, falling back to the chat id when from_user is unavailable. Never raises.
+    """
+    conversation_id = str(message.chat.id)
+    from_user = getattr(message, "from_user", None)
+    if from_user is not None and getattr(from_user, "id", None) is not None:
+        user_id = str(from_user.id)
+    else:
+        user_id = conversation_id
+    return conversation_id, user_id
+
 
 
 async def send_rag_answer(
@@ -115,8 +162,25 @@ async def send_rag_answer(
 
     await message.answer("Секунду, проверяю базу знаний...")
 
+    conversation_id, user_id = _identity(message)
+
     try:
-        data = await ask_rag(question)
+        data = await ask_rag(
+            question,
+            conversation_id=conversation_id,
+            user_id=user_id,
+        )
+
+    except httpx.ReadTimeout:
+        logger.warning(
+            "RAG API read timeout after %s seconds",
+            RAG_TIMEOUT_SECONDS,
+        )
+        await message.answer(
+            "База знаний ещё загружается или запрос обрабатывается "
+            "дольше обычного. Попробуйте повторить через минуту."
+        )
+        return
 
     except httpx.HTTPStatusError as exc:
         logger.exception("RAG API returned an HTTP error")
@@ -127,10 +191,11 @@ async def send_rag_answer(
         )
         return
 
-    except Exception as exc:
+    except Exception:
         logger.exception("RAG API request failed")
         await message.answer(
-            f"Ошибка при обращении к RAG API: {exc}"
+            "Не удалось получить ответ от базы знаний. "
+            "Попробуйте ещё раз чуть позже."
         )
         return
 

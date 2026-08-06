@@ -8,12 +8,15 @@ services:
     restart: unless-stopped
 
   rag:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.rag
     depends_on:
       - qdrant
     working_dir: /app
     volumes:
       - .:/app
+      - huggingface_cache:/root/.cache/huggingface
     env_file:
       - .env
     environment:
@@ -22,7 +25,9 @@ services:
     restart: unless-stopped
 
   bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
     depends_on:
       - rag
     working_dir: /app
@@ -37,3 +42,5 @@ services:
 
 volumes:
   qdrant_storage:
+  huggingface_cache:
+

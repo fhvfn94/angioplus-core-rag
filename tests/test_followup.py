@@ -4,6 +4,7 @@ from app.followup import (
     is_follow_up_candidate,
     rewrite_followup_question,
 )
+from app.query_normalization import normalize_user_query
 
 
 # --- entity extraction: position-based, not dictionary order ---
@@ -42,7 +43,7 @@ def test_two_distinct_entities_is_ambiguity():
 def test_required_follow_up_rewrite():
     last = "Какие системные требования у AngioPlus Core?"
     current = "А как его у становить?"  # raw user input with STT gap
-    normalized = __import__("app.query_normalization", fromlist=["normalize_user_query"]).normalize_user_query(current)
+    normalized = normalize_user_query(current)
     assert normalized == "А как его установить?"
     standalone, used = rewrite_followup_question(normalized, last)
     assert used is True
@@ -121,3 +122,61 @@ def test_rewrite_what_is_this():
     standalone, used = rewrite_followup_question(current, last)
     assert used is True
     assert standalone == "Что такое DICOM?"
+
+
+# --- regression: "кто может его/её/их <verb>" agency follow-up ---
+
+def test_rewrite_who_may_service_followup():
+    last = "Кто может устанавливать AngioPlus Core?"
+    current = "А кто может его обслуживать?"
+    normalized = normalize_user_query(current)
+    assert normalized == "А кто может его обслуживать?"
+    # Recognized as a context-dependent follow-up (pronoun reference "его").
+    assert is_follow_up_candidate(normalized, last) is True
+    standalone, used = rewrite_followup_question(normalized, last)
+    assert used is True
+    assert standalone == "Кто может обслуживать AngioPlus Core?"
+
+
+# --- regression: no-space "акто" must NOT match the agency template ---
+
+def test_rewrite_who_may_service_rejects_no_space_a():
+    last = "Кто может устанавливать AngioPlus Core?"
+    current = "акто может его обслуживать?"
+    normalized = normalize_user_query(current)
+    assert is_follow_up_candidate(normalized, last) is True
+    standalone, used = rewrite_followup_question(normalized, last)
+    # "а" must be followed by a space; "акто" must not trigger the rewrite.
+    assert used is False
+    assert standalone == normalized
+
+
+# --- regression: software-version follow-up stays conservative ---
+# The prior turn contains no canonical domain entity, so the rewrite is
+# conservatively declined even though the follow-up is recognised as
+# context-dependent. Production must keep this behaviour.
+
+def test_software_version_followup_recognised_but_not_rewritten():
+    last = "Где посмотреть версию программного обеспечения?"
+    current = "А зачем она нужна при обращении в поддержку?"
+    normalized = normalize_user_query(current)
+    # Context-dependent signal is present (continuation starter / no entity).
+    assert is_follow_up_candidate(normalized, last) is True
+    # No canonical entity is resolvable in the prior turn -> no rewrite.
+    standalone, used = rewrite_followup_question(normalized, last)
+    assert used is False
+    assert standalone == normalized
+
+
+# --- safety: agency follow-up must remain blocked on entity ambiguity ---
+
+def test_rewrite_who_may_service_blocked_on_ambiguity():
+    last = "Расскажи про AngioPlus Core и PStation"
+    current = "А кто может его обслуживать?"
+    normalized = normalize_user_query(current)
+    standalone, used = rewrite_followup_question(normalized, last)
+    # Two distinct entities -> ambiguity -> conservative decline.
+    assert used is False
+    assert standalone == normalized
+
+

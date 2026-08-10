@@ -90,7 +90,8 @@ def test_branch_gate_false(monkeypatch):
     _setup(monkeypatch, _chunks(), _FakeLLM(gate=False))
     resp = rag.ask(_req())
     assert resp.answer == rag.NOT_FOUND
-    assert resp.sources  # sources preserved even on gate=false
+    # Intentional: on gate=false no unrelated sources are shown.
+    assert resp.sources == []
 
 
 def test_branch_secret_blocked(monkeypatch):

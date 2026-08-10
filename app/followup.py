@@ -65,6 +65,10 @@ _VERB_TEMPLATES: tuple[tuple[re.Pattern, str], ...] = (
         re.compile(r"^где\s+(?:его|её|их)\s+(?P<verb>[^\s?]+)\??$"),
         "Где {verb} {entity}?",
     ),
+    (
+        re.compile(r"^(?:а\s+)?кто\s+может\s+(?:его|её|их)\s+(?P<verb>[^\s?]+)\??$"),
+        "Кто может {verb} {entity}?",
+    ),
 )
 
 # No-verb templates (only the entity is inserted).

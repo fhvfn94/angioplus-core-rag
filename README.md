@@ -1,178 +1,336 @@
-PROJECT: AngioPlus Core AI Support Assistant (RAG)
+# AngioPlus Core AI Support Assistant
 
-ROLE:
-Ты — Senior AI Engineer и System Architect.
-Ты помогаешь пошагово разрабатывать production-grade RAG систему для техподдержки медицинского ПО AngioPlus Core.
+RAG-based AI assistant for technical support of the AngioPlus Core medical software.
 
-CONTEXT:
-Система будет использовать:
-- IFU (официальное руководство пользователя)
-- Training материалы
-- Документ L1/L2 (вопросы и процессы поддержки)
+The system answers questions strictly from indexed product documentation and is intended to support L1/L2 technical support workflows.
 
-Цель:
-Создать AI ассистента для техподдержки:
-- L1 (оператор)
-- L2 (инженер)
-- L3 (эскалация разработчику)
+## Current Status
 
-CRITICAL REQUIREMENTS:
-1. Accuracy > creativity
-2. Всегда опираться на документы (RAG)
-3. Нельзя придумывать ответы
-4. Если нет информации — говорить "недостаточно данных"
-5. Определять критические инциденты (red flags)
-6. В критических случаях — эскалация (НЕ давать решение)
+The MVP is operational.
 
----
+Implemented:
 
-ARCHITECTURE (MVP):
+- Telegram bot
+- text questions
+- voice questions
+- PDF / DOCX / XLSX ingestion
+- local multilingual embeddings
+- Qdrant vector search
+- DeepSeek answer generation
+- query normalization
+- short conversation memory
+- follow-up question rewriting
+- source metadata
+- citation of chunks actually used by the LLM
+- secret filtering
+- fallback when documentation does not contain the answer
 
-Ingestion Pipeline:
-documents → parsing → chunking → metadata → embeddings → vector DB
+## Architecture
 
-Runtime:
-user question → retrieval → context → LLM → answer → safety check
+### Ingestion
 
----
+documents
+→ parsing
+→ structured chunking
+→ metadata
+→ BAAI/bge-m3 embeddings
+→ Qdrant
 
-TECH STACK:
+### Runtime
 
-Python 3.11+
-FastAPI
-Qdrant (vector DB)
-LlamaIndex (RAG orchestration)
-Google Gemini (через Google AI Studio API)
+Telegram message
+→ query normalization
+→ optional conversation-context rewrite
+→ BAAI/bge-m3 query embedding
+→ Qdrant retrieval
+→ direct-answer gate
+→ DeepSeek generation
+→ source citation extraction
+→ secret/output safety filter
+→ Telegram response
 
----
+### Voice
 
-PROJECT STRUCTURE:
+Telegram voice
+→ Gemini audio transcription
+→ text query
+→ normal RAG pipeline
 
-app/
-  main.py
-  config.py
+Voice transcription may later be migrated to a local Whisper/faster-whisper implementation.
 
-  rag/
-    loader.py
-    chunker.py
-    embedder.py
-    vector_store.py
-    retriever.py
-    answerer.py
-    safety_router.py
+## Technology Stack
 
-scripts/
-  ingest_documents.py
+- Python 3.12
+- FastAPI
+- aiogram
+- Docker Compose
+- Qdrant
+- sentence-transformers
+- BAAI/bge-m3
+- DeepSeek API
+- OpenAI-compatible Python SDK for DeepSeek API access
+- Google Gemini API for voice transcription
 
-data/
-  raw/
-  processed/
+Important:
 
----
+The OpenAI Python package is currently used only as an OpenAI-compatible client for DeepSeek.
 
-DOCUMENT TYPES:
+Requests are sent to:
 
-Каждый документ должен быть классифицирован:
+https://api.deepseek.com
 
-- IFU → нормативный источник (highest priority)
-- Training → практические кейсы
-- L1/L2 → support логика
-- Commercial → low priority
+The project does NOT currently use OpenAI models or the OpenAI API.
 
----
+## Embeddings
 
-METADATA FORMAT:
+Provider:
 
-Каждый chunk должен иметь:
+sentence_transformers
 
-{
-  source: "IFU | TRAINING | L1L2 | COMMERCIAL",
-  section: "string",
-  topic: "string",
-  support_level: "L1 | L2 | L3",
-  risk_level: "normal | warning | critical",
-  version: "string"
-}
+Model:
 
----
+BAAI/bge-m3
 
-CHUNKING RULES:
+Dimension:
 
-- Размер: 500–1000 токенов
-- Не резать логические блоки
-- IFU резать по разделам
-- Training резать по шагам процесса
+1024
 
----
+Distance:
 
-RETRIEVAL RULES:
+COSINE
 
-- Top K = 3–5
-- Приоритет IFU > остальные
-- Фильтрация по support_level
+Device:
 
----
+CPU
 
-ANSWER RULES:
+Qdrant collection:
 
-Ответ должен:
-1. Опирается на retrieved chunks
-2. Быть структурирован:
-   - краткий ответ
-   - шаги решения
-   - ссылка на источник
-3. Указывать уровень уверенности
+angioplus_documents_bge_m3
 
----
+Current indexed dataset:
 
-SAFETY RULES (ОЧЕНЬ ВАЖНО):
+6 documents
+118 chunks
 
-Если найдено:
-- критический инцидент
-- медицинский риск
-- сбой системы
+## LLM
 
-ТО:
-НЕ давать решение
-выдать:
-"Требуется эскалация на L2/L3"
+Provider:
 
----
+DeepSeek
 
-DEVELOPMENT STRATEGY:
+Current model:
 
-Ты работаешь строго по шагам:
+deepseek-v4-flash
 
-STEP 1 → ingestion pipeline
-STEP 2 → vector DB
-STEP 3 → retrieval
-STEP 4 → QA chain
-STEP 5 → safety layer
-STEP 6 → API
+The LLM receives only retrieved and sanitized document context.
 
-НЕ ПЕРЕПРЫГИВАТЬ этапы
+If the available context does not answer the question, the assistant must respond:
 
----
+"Такой информации нет в имеющейся документации."
 
-YOUR BEHAVIOR:
+## Retrieval
 
-- Пиши чистый production-ready код
-- Делай маленькие шаги
-- После каждого шага объясняй что сделано
-- Если есть неопределенность — спрашивай
-- Предлагай улучшения архитектуры
+Current retrieval depth:
 
----
+top_k = 10
 
-FIRST TASK:
+This value was increased from 5 after regression testing showed that a correct IFU chunk could appear at position 6.
 
-Реализуй ingest_documents.py:
+Example:
 
-Функции:
-1. загрузка PDF/DOCX
-2. извлечение текста
-3. разбиение на чанки
-4. добавление metadata
-5. сохранение в Qdrant
+Question:
+"Где посмотреть версию программного обеспечения?"
 
-Сделай код модульным и расширяемым.
+Relevant IFU chunk:
+position 6
+
+With top_k=5 the answer was missed.
+With top_k=10 the correct answer is retrieved.
+
+Do not reduce top_k without regression testing.
+
+## Source Priority
+
+Source authority:
+
+1. IFU / official regulatory documentation
+2. Official service and administrator documentation
+3. Release notes / known issues
+4. L1/L2 internal support materials
+5. FAQ / training materials
+6. Commercial materials
+
+If IFU conflicts with another source, IFU wins.
+
+FAQ and training materials may supplement IFU but must not override it.
+
+## Source Citations
+
+The LLM receives numbered retrieved chunks:
+
+[Chunk 1]
+[Chunk 2]
+...
+
+For successful answers it returns an internal marker:
+
+[[USED_CHUNKS: 2, 6]]
+
+The application removes this marker before sending the response to the user.
+
+Only metadata from the cited chunks is shown in the Telegram "Источники" section.
+
+This prevents unrelated top-ranked Qdrant results from being presented as answer sources.
+
+## Conversation Context
+
+Conversation context is enabled.
+
+Current configuration:
+
+CONVERSATION_TTL_SECONDS=1800
+CONVERSATION_MAX_TURNS=3
+
+The system can rewrite follow-up questions into standalone retrieval questions.
+
+Example:
+
+User:
+"Кто может устанавливать AngioPlus Core?"
+
+Follow-up:
+"А кто может его обслуживать?"
+
+The second question may use recent conversation context to resolve the reference.
+
+## Query Normalization
+
+Query normalization is enabled before embedding and retrieval.
+
+The original user question and the normalized/standalone versions are tracked separately in logs.
+
+## Safety
+
+The assistant must:
+
+- answer only from retrieved documentation
+- never invent missing procedures
+- never expose passwords, API keys, tokens or credentials
+- distinguish mandatory IFU requirements from recommendations
+- distinguish "not evaluated" from "prohibited"
+- return a documentation-not-found response when direct support is absent
+
+Secrets are sanitized before context is sent to external LLM providers.
+
+Generated output also passes through a secret filter.
+
+## Documents
+
+Current knowledge base includes:
+
+- AngioPlus Core v2.5 IFU_RU_Final.pdf
+- 2025July.pdf
+- Common Info to Distributor - commercial (1).pdf
+- Competitor_2025.pdf
+- Development_Questions_L1_L2.docx
+- Q&A List ENG.xlsx
+
+## Qdrant
+
+Current collection:
+
+angioplus_documents_bge_m3
+
+Current state after ingestion:
+
+points = 118
+status = green
+vector size = 1024
+distance = COSINE
+
+## Main Environment Configuration
+
+Secrets must never be committed.
+
+Important configuration:
+
+EMBEDDING_PROVIDER=sentence_transformers
+LOCAL_EMBEDDING_MODEL=BAAI/bge-m3
+EMBEDDING_DEVICE=cpu
+EMBEDDING_BATCH_SIZE=4
+
+QDRANT_COLLECTION=angioplus_documents_bge_m3
+
+LLM_PROVIDER=deepseek
+DEEPSEEK_MODEL=deepseek-v4-flash
+
+QUERY_NORMALIZATION_ENABLED=true
+QUERY_CONTEXT_ENABLED=true
+
+CONVERSATION_TTL_SECONDS=1800
+CONVERSATION_MAX_TURNS=3
+
+QUERY_LOW_SCORE_LOG_THRESHOLD=0.45
+
+## Development Workflow
+
+Development should normally be performed locally.
+
+Recommended flow:
+
+local VS Code
+→ implementation
+→ tests
+→ git commit
+→ git push origin main
+→ server git pull --ff-only origin main
+→ rebuild/restart affected Docker services
+→ production smoke test
+
+Avoid editing production server code directly except for emergency diagnostics.
+
+## Current Known Issues / Improvements
+
+### Response latency
+
+Typical request:
+
+- local embedding: ~0.5–1.0 s
+- Qdrant: ~0.1 s
+- DeepSeek gate: ~1–2 s
+- DeepSeek generation: ~3–8 s
+
+Large answers may take significantly longer.
+
+The direct-answer gate currently causes a second DeepSeek request.
+
+A future optimization may merge gate + generation into one LLM request after regression testing proves grounding remains safe.
+
+### Voice transcription
+
+Voice currently depends on Gemini.
+
+Possible future migration:
+
+faster-whisper / whisper.cpp
+
+This would remove an external dependency and allow local speech recognition.
+
+### Retrieval
+
+Dense BGE-M3 retrieval works, but further testing may justify:
+
+- hybrid dense + lexical search
+- reranking
+- query expansion
+- metadata-aware retrieval
+
+Do not implement these without measuring retrieval failures first.
+
+## Development Principle
+
+Accuracy > creativity.
+
+Do not change architecture because an alternative sounds theoretically better.
+
+Every retrieval, safety or prompt change must be validated against regression questions.

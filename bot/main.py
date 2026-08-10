@@ -8,13 +8,17 @@ import os
 import httpx
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
-from services.stt import STTService
+from services.stt import STTService, resolve_stt_provider
 from time import perf_counter
 import asyncio
 
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 RAG_API_URL = os.getenv("RAG_API_URL", "http://rag:8000/ask").strip()
+
+# Validate STT_PROVIDER at startup (defaults to "gemini"). Fails fast on any
+# unknown value so a bad configuration cannot silently fall back.
+STT_PROVIDER = resolve_stt_provider()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_AUDIO_MODEL = os.getenv(
@@ -51,7 +55,9 @@ RAG_TIMEOUT_SECONDS = _read_rag_timeout()
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-if not GEMINI_API_KEY:
+# GEMINI_API_KEY is only required for the "gemini" provider. Once local
+# providers (faster-whisper) are added, this guard becomes provider-specific.
+if STT_PROVIDER == "gemini" and not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set")
 
 

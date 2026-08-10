@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 from time import perf_counter
 
 from aiogram import Bot, types
@@ -12,6 +13,28 @@ from google.genai import types as genai_types
 
 
 logger = logging.getLogger(__name__)
+
+# STT provider selection.
+# Only "gemini" is supported at this step. faster-whisper is NOT implemented yet.
+# Keeping it isolated here so bot/main.py and tests share one resolver.
+STT_DEFAULT_PROVIDER = "gemini"
+SUPPORTED_STT_PROVIDERS: tuple[str, ...] = ("gemini",)
+
+
+def resolve_stt_provider() -> str:
+    """Read and validate the STT_PROVIDER env value.
+
+    Defaults to "gemini" (current production behaviour). Fails fast on any
+    unknown value so misconfiguration is caught at startup.
+    """
+    raw = (os.getenv("STT_PROVIDER") or "").strip()
+    provider = (raw or STT_DEFAULT_PROVIDER).lower()
+    if provider not in SUPPORTED_STT_PROVIDERS:
+        supported = ", ".join(SUPPORTED_STT_PROVIDERS)
+        raise ValueError(
+            f"Unknown STT_PROVIDER={raw!r}. Supported values: {supported}."
+        )
+    return provider
 
 
 class STTService:
@@ -122,3 +145,4 @@ class STTService:
         )
 
         return transcription
+

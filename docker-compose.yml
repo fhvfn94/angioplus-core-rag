@@ -14,6 +14,8 @@ services:
     depends_on:
       - qdrant
     working_dir: /app
+    ports:
+    - "127.0.0.1:8000:8000"
     volumes:
       - .:/app
       - huggingface_cache:/root/.cache/huggingface

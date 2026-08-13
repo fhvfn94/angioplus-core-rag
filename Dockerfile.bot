@@ -6,8 +6,16 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# faster-whisper/CTranslate2 CPU runtime needs the GNU OpenMP runtime
+# (libgomp1) for multi-threaded CPU inference. PyAV provides its own ffmpeg
+# libraries via wheels, so no system ffmpeg is installed.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Telegram bot + STT only. No torch / ML / Qdrant / openai / document readers.
 COPY requirements-bot.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip \
     && pip install -r requirements-bot.txt
+

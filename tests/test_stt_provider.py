@@ -25,7 +25,7 @@ def clear_stt_provider(monkeypatch):
 def test_default_provider_is_gemini(clear_stt_provider):
     assert resolve_stt_provider() == "gemini"
     assert STT_DEFAULT_PROVIDER == "gemini"
-    assert SUPPORTED_STT_PROVIDERS == ("gemini",)
+    assert SUPPORTED_STT_PROVIDERS == ("gemini", "faster_whisper")
 
 
 def test_explicit_gemini(clear_stt_provider, monkeypatch):
@@ -49,7 +49,7 @@ def test_empty_provider_value_uses_default(clear_stt_provider, monkeypatch):
 
 
 def test_unknown_provider_raises(clear_stt_provider, monkeypatch):
-    monkeypatch.setenv("STT_PROVIDER", "faster_whisper")
+    monkeypatch.setenv("STT_PROVIDER", "bogus")
     with pytest.raises(ValueError, match="Unknown STT_PROVIDER"):
         resolve_stt_provider()
 
@@ -57,7 +57,12 @@ def test_unknown_provider_raises(clear_stt_provider, monkeypatch):
 def test_unknown_provider_message_lists_supported(
     clear_stt_provider, monkeypatch
 ):
-    monkeypatch.setenv("STT_PROVIDER", "bogus")
+    monkeypatch.setenv("STT_PROVIDER", "whisper-ai")
     with pytest.raises(ValueError) as exc_info:
         resolve_stt_provider()
-    assert "Supported values: gemini" in str(exc_info.value)
+    assert "Supported values: gemini, faster_whisper" in str(exc_info.value)
+
+
+def test_faster_whisper_provider_selected(clear_stt_provider, monkeypatch):
+    monkeypatch.setenv("STT_PROVIDER", "faster_whisper")
+    assert resolve_stt_provider() == "faster_whisper"

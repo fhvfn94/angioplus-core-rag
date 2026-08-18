@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from functools import cached_property
+from time import perf_counter
 from typing import Optional
 
 from pydantic import ValidationError
@@ -42,6 +44,39 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except (TypeError, ValueError):
         return default
+
+
+logger = logging.getLogger(__name__)
+
+# Maximum elapsed seconds of the first gate attempt that still allows a
+# single immediate retry on INVALID_RESPONSE without busting TWIN's 10 s
+# external deadline. Gate calls normally take ~1.4 - 2 s; the production
+# outlier first request took ~7.1 s. 3.0 s separates a fast, retryable
+# malformed response from a slow/systemic failure we should not amplify.
+GATE_INVALID_RETRY_BUDGET = 3.0
+
+
+def _normalize_envelope(content: str) -> str:
+    """Strip surrounding whitespace and a single outer Markdown fence.
+
+    Only an exact outer ```json ... ``` / ``` ... ``` / ~~~ ... ~~~ fence
+    is removed. Arbitrary prose around JSON is NOT heuristically parsed.
+    """
+    text = content.strip()
+    if not text:
+        return text
+    lines = text.split("\n")
+    if len(lines) < 3:
+        return text
+    opener = lines[0].strip()
+    closer = lines[-1].strip()
+    if not (opener.startswith("```") or opener.startswith("~~~")):
+        return text
+    fence_char = "`" if opener.startswith("```") else "~"
+    lang = opener.lstrip(fence_char).strip().lower()
+    if lang in ("", "json") and closer.startswith(fence_char * 3):
+        return "\n".join(lines[1:-1]).strip()
+    return text
 
 
 class DeepSeekProvider(LLMProvider):
@@ -173,6 +208,26 @@ class DeepSeekProvider(LLMProvider):
             f"{question}\n"
         )
 
+        return self._run_gate(prompt)
+
+    def _run_gate(self, prompt: str) -> GateResult:
+        """Run the gate, retrying once on a fast INVALID_RESPONSE."""
+        started = perf_counter()
+        try:
+            return self._gate_attempt(prompt)
+        except LLMError as exc:
+            if exc.error_type is LLMErrorType.INVALID_RESPONSE:
+                first_elapsed = perf_counter() - started
+                if first_elapsed <= GATE_INVALID_RETRY_BUDGET:
+                    logger.warning(
+                        "gate invalid_response retry "
+                        "first_attempt_seconds=%.2f",
+                        first_elapsed,
+                    )
+                    return self._gate_attempt(prompt)
+            raise
+
+    def _gate_attempt(self, prompt: str) -> GateResult:
         try:
             response = self._client.chat.completions.create(
                 model=self._model,
@@ -204,15 +259,25 @@ class DeepSeekProvider(LLMProvider):
                 None,
             )
 
+        normalized = _normalize_envelope(content)
+
         try:
-            data = json.loads(content)
+            data = json.loads(normalized)
         except (json.JSONDecodeError, TypeError) as exc:
-            raise _map_error(exc) from exc
+            raise LLMError(
+                LLMErrorType.INVALID_RESPONSE,
+                "LLM returned malformed JSON",
+                None,
+            ) from exc
 
         try:
             return GateResult.model_validate(data, strict=True)
         except ValidationError as exc:
-            raise _map_error(exc) from exc
+            raise LLMError(
+                LLMErrorType.INVALID_RESPONSE,
+                "LLM returned a schema-invalid response",
+                None,
+            ) from exc
 
     # -- answer generation --------------------------------------------------
 

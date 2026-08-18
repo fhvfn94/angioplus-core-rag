@@ -238,6 +238,7 @@ class DeepSeekProvider(LLMProvider):
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
+                extra_body={"thinking": {"type": "disabled"}},
             )
         except LLMError:
             raise

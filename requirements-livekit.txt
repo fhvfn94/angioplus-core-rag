@@ -1,8 +1,17 @@
-# Phase A: only the RAG API boundary client.
+# LiveKit voice component dependencies (Phase A + Phase B).
 #
-# livekit-agents is intentionally NOT listed yet: Phase A does not import
-# LiveKit. It will be added in a later phase (STT/TTS and the agent server).
+# Phase A boundary client:
+#   httpx  -> voice/rag_client.py (async HTTP transport for the RAG API)
 #
-# httpx is already used across the project (bot/rag) and is the async HTTP
-# transport for voice/rag_client.py.
+# Phase B minimal LiveKit Agents runtime:
+#   livekit-agents==1.7.0 -> the current 1.x framework (AgentServer /
+#     @rtc_session / WorkerOptions / JobContext). This is the base runtime; it
+#     pulls in its own core deps (av, sounddevice, openai, pydantic, etc.).
+#   No STT/TTS/plugin extras are required in Phase B (no speech yet).
+#
+# The pin matches the package actually installed and verified in this
+# environment.
 httpx>=0.27
+
+livekit-agents==1.7.0
+

@@ -1,0 +1,8 @@
+# Phase A: only the RAG API boundary client.
+#
+# livekit-agents is intentionally NOT listed yet: Phase A does not import
+# LiveKit. It will be added in a later phase (STT/TTS and the agent server).
+#
+# httpx is already used across the project (bot/rag) and is the async HTTP
+# transport for voice/rag_client.py.
+httpx>=0.27

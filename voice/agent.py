@@ -27,6 +27,7 @@ from livekit import agents
 from livekit.agents.worker import ServerType
 from livekit.rtc import DataPacket
 
+from voice.audio_transcriber import AudioTrackListener
 from voice.config import load_rag_config
 from voice.rag_client import (
     RagClient,
@@ -62,6 +63,24 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # Connect to the room (AgentSession would auto-connect; as a programmatic
     # participant we control it explicitly).
     await ctx.connect()
+
+    # Real-mic STT/VAD integration (Phase D1.4): subscribe to any remote audio
+    # track and feed its AudioFrames through StreamAdapter(FasterWhisperSTT,
+    # Silero VAD), logging FINAL_TRANSCRIPT. A single AudioTrackListener owns
+    # one STT + VAD reused across utterances for this session (no per-utterance
+    # Whisper model rebuild). The transcript is only logged, not sent to RAG
+    # yet. The track callbacks are synchronous (EventEmitter rule) and schedule
+    # async work internally.
+    audio = AudioTrackListener()
+    ctx.room.on("track_subscribed", audio.on_track_subscribed)
+    ctx.room.on("track_unsubscribed", audio.on_track_unsubscribed)
+
+    def _on_room_disconnected(_reason) -> None:
+        """Cancel audio tasks on disconnect (synchronous callback)."""
+        cleanup = asyncio.create_task(audio.cancel_all())
+        cleanup.add_done_callback(_log_task_failure)
+
+    ctx.room.on("disconnected", _on_room_disconnected)
 
     rag = _make_rag_client()
 

@@ -6,6 +6,11 @@ rest of the code speaks to a plain `agents.vad.VAD` and exposes the tunables we
 care about for turn detection in our Russian voice assistant.
 
 This module contains no RAG, TTS, aiogram, or LiveKit Server code.
+
+Phase D1.4 note: `livekit.plugins.silero` is imported at module scope so its
+`Plugin.register_plugin()` call runs on the main thread during normal
+import/startup. Importing it lazily from a background audio-processing task
+would raise `RuntimeError("Plugins must be registered on the main thread")`.
 """
 from __future__ import annotations
 
@@ -14,6 +19,7 @@ from dataclasses import dataclass, replace
 from typing import Callable
 
 from livekit import agents
+from livekit.plugins import silero
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +70,13 @@ def load_vad(
     """
     cfg = config or VADConfig()
 
+    # NOTE: `silero` is imported at module scope (above) so that
+    # `livekit.plugins.silero` registers its Plugin on the main thread during
+    # normal startup, never lazily from a background audio-processing task.
+    # Importing it here (e.g. inside an asyncio task) would hit
+    # `Plugin.register_plugin` on a non-main thread and raise
+    # RuntimeError("Plugins must be registered on the main thread").
     if vad_loader is None:
-        from livekit.plugins import silero
-
         vad_loader = silero.VAD.load
 
     logger.info(

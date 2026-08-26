@@ -1,0 +1,304 @@
+# -*- coding: utf-8 -*-
+"""Unit tests for the LiveKit faster-whisper STT layer (voice/stt.py).
+
+These tests do NOT download or load a real Whisper model. A fake model is
+injected via `FasterWhisperSTT(_model_factory=...)` so `voice.stt` is exercised
+against the real LiveKit SDK / rtc.AudioFrame types without the heavy library.
+"""
+from __future__ import annotations
+
+import asyncio
+import io
+import threading
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+from livekit import agents, rtc
+
+from voice import stt as voice_stt
+from voice.stt import FasterWhisperSTT, WHISPER_SAMPLE_RATE
+
+
+# ---------------------------------------------------------------------------
+# Fake model
+# ---------------------------------------------------------------------------
+
+class FakeWhisperModel:
+    """Records transcribe kwargs and returns configurable segments."""
+
+    constructed = []  # reset per test
+    segments = []  # reset per test
+    raise_on_transcribe = None
+
+    def __init__(self, model, device, compute_type):
+        self.model_arg = model
+        self.device_arg = device
+        self.compute_type_arg = compute_type
+        type(self).constructed.append((model, device, compute_type))
+        self.calls = []
+
+    def transcribe(self, audio, language=None, initial_prompt=None,
+                   beam_size=None, best_of=None, temperature=None, **kw):
+        rec = {
+            "audio_is_bytesio": isinstance(audio, io.BytesIO),
+            "language": language,
+            "initial_prompt": initial_prompt,
+            "beam_size": beam_size,
+            "best_of": best_of,
+            "temperature": temperature,
+            "thread_id": threading.current_thread().ident,
+        }
+        self.calls.append(rec)
+        if type(self).raise_on_transcribe is not None:
+            raise type(self).raise_on_transcribe("boom")
+        return iter(type(self).segments), {"language": language}
+
+
+def _make_stt(**kwargs) -> FasterWhisperSTT:
+    return FasterWhisperSTT(_model_factory=FakeWhisperModel, **kwargs)
+
+
+def _mk_frame(sample_rate=16000, channels=1, n=320, seed=0):
+    if channels > 1:
+        rng = np.random.default_rng(seed)
+        data = rng.integers(-8000, 8000, size=n * channels).astype(np.int16)
+    else:
+        data = (np.arange(n, dtype=np.int16) * 2)
+    return rtc.AudioFrame(
+        data=data.tobytes(),
+        sample_rate=sample_rate,
+        num_channels=channels,
+        samples_per_channel=n,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_fake():
+    FakeWhisperModel.constructed.clear()
+    FakeWhisperModel.segments = [
+        SimpleNamespace(text="Калибровка"),
+        SimpleNamespace(text=" катетера"),
+        SimpleNamespace(text="."),
+    ]
+    FakeWhisperModel.raise_on_transcribe = None
+    yield
+
+
+# ---------------------------------------------------------------------------
+# Config parsing
+# ---------------------------------------------------------------------------
+
+def test_defaults_match_telegram_stt():
+    stt = FasterWhisperSTT()
+    # defaults mirror bot/services/stt.py
+    assert not stt.is_model_loaded
+    assert stt._model_name == "small"
+    assert stt._device == "cpu"
+    assert stt._compute_type == "int8"
+    assert stt._language is None  # STT_LANGUAGE unset -> auto-detect
+    assert stt._initial_prompt is None  # WHISPER_INITIAL_PROMPT unset
+
+
+def test_custom_constructor_overrides(fake=None):
+    stt = FasterWhisperSTT(
+        model="large-v3",
+        device="cuda",
+        compute_type="float16",
+        language="ru",
+        initial_prompt="Специальный медицинский словарь",
+    )
+    assert stt.model == "large-v3"
+    assert stt.provider == "faster-whisper"
+    assert stt._device == "cuda"
+    assert stt._compute_type == "float16"
+    assert stt._language == "ru"
+    assert stt._initial_prompt == "Специальный медицинский словарь"
+
+
+def test_capabilities_are_offline_non_streaming():
+    stt = _make_stt()
+    assert stt.capabilities.streaming is False
+    assert stt.capabilities.interim_results is False
+    assert stt.capabilities.offline_recognize is True
+
+
+# ---------------------------------------------------------------------------
+# Lazy load + reuse
+# ---------------------------------------------------------------------------
+
+def test_model_is_lazy_and_not_loaded_at_construction():
+    stt = _make_stt()
+    assert stt.is_model_loaded is False
+    assert FakeWhisperModel.constructed == []
+
+
+def test_model_reused_across_recognitions():
+    stt = _make_stt()
+    loop = asyncio.new_event_loop()
+
+    async def go():
+        f = _mk_frame()
+        await stt._recognize_impl(f, conn_options=agents.APIConnectOptions())
+        await stt._recognize_impl(f, conn_options=agents.APIConnectOptions())
+
+    try:
+        loop.run_until_complete(go())
+    finally:
+        loop.close()
+
+    # Only one model constructed, two transcribe calls on the same instance.
+    assert FakeWhisperModel.constructed == [("small", "cpu", "int8")]
+    model = stt._model
+    assert model is not None
+    assert len(model.calls) == 2
+    assert stt.is_model_loaded is True
+
+
+# ---------------------------------------------------------------------------
+# Transcribe options forwarding
+# ---------------------------------------------------------------------------
+
+def _recognize_once(stt, frame=None, *, language=None):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(
+            stt._recognize_impl(
+                frame if frame is not None else _mk_frame(),
+                language=language,
+                conn_options=agents.APIConnectOptions(),
+            )
+        )
+    finally:
+        loop.close()
+
+
+def test_language_from_config_is_forwarded():
+    stt = _make_stt(language="ru", initial_prompt="prompt")
+    _recognize_once(stt)
+    model = stt._model
+    assert model.calls[0]["language"] == "ru"
+
+
+def test_explicit_language_argument_overrides_config():
+    stt = _make_stt(language="ru")
+    _recognize_once(stt, language="uk")
+    assert stt._model.calls[0]["language"] == "uk"
+
+
+def test_initial_prompt_is_forwarded():
+    stt = _make_stt(initial_prompt="AngioPlus термины")
+    _recognize_once(stt)
+    assert stt._model.calls[0]["initial_prompt"] == "AngioPlus термины"
+
+
+def test_baseline_decoding_options_are_used():
+    stt = _make_stt()
+    _recognize_once(stt)
+    call = stt._model.calls[0]
+    assert call["beam_size"] == 1
+    assert call["best_of"] == 1
+    assert call["temperature"] == 0
+
+
+def test_audio_passed_as_inmemory_bytesio():
+    stt = _make_stt()
+    _recognize_once(stt)
+    assert stt._model.calls[0]["audio_is_bytesio"] is True
+
+
+# ---------------------------------------------------------------------------
+# Transcript joining + FINAL_TRANSCRIPT structure
+# ---------------------------------------------------------------------------
+
+def test_segment_joining():
+    stt = _make_stt()
+    event = _recognize_once(stt)
+    assert event.alternatives[0].text == "Калибровка катетера."
+
+
+def test_returns_final_transcript_event():
+    stt = _make_stt()
+    event = _recognize_once(stt)
+    assert event.type.name == "FINAL_TRANSCRIPT"
+    assert len(event.alternatives) == 1
+    assert event.request_id  # non-empty uuid
+    assert event.alternatives[0].language == "auto" or event.alternatives[0].language
+
+
+def test_empty_transcript_raises():
+    stt = _make_stt()
+    FakeWhisperModel.segments = []
+    with pytest.raises(ValueError, match="empty transcription"):
+        _recognize_once(stt)
+
+
+def test_model_exception_propagates():
+    stt = _make_stt()
+    FakeWhisperModel.raise_on_transcribe = RuntimeError
+    with pytest.raises(RuntimeError, match="boom"):
+        _recognize_once(stt)
+
+
+# ---------------------------------------------------------------------------
+# Audio handling (normalization)
+# ---------------------------------------------------------------------------
+
+def test_mono16k_frame_passthrough_to_wav():
+    f = _mk_frame(sample_rate=16000, channels=1, n=320)
+    wav = voice_stt._buffer_to_mono16k_wav(f)
+    assert wav[:4] == b"RIFF"  # valid WAV header
+
+
+def test_list_of_frames_merged():
+    f1 = _mk_frame(sample_rate=16000, channels=1, n=320)
+    f2 = _mk_frame(sample_rate=16000, channels=1, n=320)
+    wav = voice_stt._buffer_to_mono16k_wav([f1, f2])
+    assert wav[:4] == b"RIFF"
+
+
+def test_stereo_resampled_to_mono16k():
+    f = _mk_frame(sample_rate=48000, channels=2, n=960)
+    wav = voice_stt._buffer_to_mono16k_wav(f)
+    assert wav[:4] == b"RIFF"
+    # header frame rate
+    import struct
+    fmt = struct.unpack("<HHIIHH", wav[20:36])
+    assert fmt[2] == WHISPER_SAMPLE_RATE  # sample rate field
+    assert fmt[0] == 1  # mono channel
+
+
+def test_recognize_impl_accepts_audioframe_and_list():
+    stt = _make_stt()
+    # single frame
+    e1 = _recognize_once(stt, _mk_frame(sample_rate=16000, channels=1))
+    # list of frames
+    e2 = _recognize_once(stt, [_mk_frame(seed=1), _mk_frame(seed=2)])
+    assert e1.alternatives[0].text == e2.alternatives[0].text == "Калибровка катетера."
+
+
+# ---------------------------------------------------------------------------
+# Blocking inference runs off the event loop thread
+# ---------------------------------------------------------------------------
+
+def test_inference_runs_off_event_loop_thread():
+    stt = _make_stt()
+    main_thread_id = threading.current_thread().ident
+    worker_thread_ids = []
+
+    orig_transcribe = FakeWhisperModel.transcribe
+
+    def patched_transcribe(self, *a, **kw):
+        worker_thread_ids.append(threading.current_thread().ident)
+        return orig_transcribe(self, *a, **kw)
+
+    FakeWhisperModel.transcribe = patched_transcribe
+    try:
+        _recognize_once(stt)
+    finally:
+        FakeWhisperModel.transcribe = orig_transcribe
+
+    # The blocking model call must run in a worker (to_thread) thread, not the
+    # test thread that created the event loop.
+    assert worker_thread_ids, "transcribe was never called"
+    assert worker_thread_ids[0] != main_thread_id

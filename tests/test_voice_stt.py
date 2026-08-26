@@ -96,8 +96,36 @@ def test_defaults_match_telegram_stt():
     assert stt._model_name == "small"
     assert stt._device == "cpu"
     assert stt._compute_type == "int8"
-    assert stt._language is None  # STT_LANGUAGE unset -> auto-detect
-    assert stt._initial_prompt is None  # WHISPER_INITIAL_PROMPT unset
+    # Phase D1.5: the voice path defaults to Russian (no auto-detect) and a
+    # concise AngioPlus vocabulary initial_prompt is active by default.
+    assert stt._language == "ru"
+    assert stt._initial_prompt and "катетер" in stt._initial_prompt
+
+
+def test_default_voice_config_forces_russian():
+    """The default (env) config forwards language='ru' to faster-whisper,
+    skipping automatic language detection (Phase D1.5 TASK 1)."""
+    stt = _make_stt()  # no language kwarg -> module default "ru"
+    _recognize_once(stt)
+    assert stt._model.calls[0]["language"] == "ru"
+
+
+def test_default_initial_prompt_is_angioplus_vocab():
+    """The default initial_prompt carries AngioPlus vocabulary (TASK 2)."""
+    stt = _make_stt()  # no initial_prompt kwarg -> module default prompt
+    _recognize_once(stt)
+    call = stt._model.calls[0]["initial_prompt"]
+    assert call
+    for token in ("катетер", "μFR", "ангиография", "AngioPlus"):
+        assert token in call
+
+
+def test_initial_prompt_can_be_disabled():
+    """initial_prompt=None disables conditioning (WHISPER_INITIAL_PROMPT empty
+    maps to None in the constructor)."""
+    stt = _make_stt(initial_prompt=None)
+    _recognize_once(stt)
+    assert stt._model.calls[0]["initial_prompt"] is None
 
 
 def test_custom_constructor_overrides(fake=None):
@@ -302,3 +330,44 @@ def test_inference_runs_off_event_loop_thread():
     # test thread that created the event loop.
     assert worker_thread_ids, "transcribe was never called"
     assert worker_thread_ids[0] != main_thread_id
+
+
+# ---------------------------------------------------------------------------
+# Latency instrumentation helpers (Phase D1.5 TASK 4) — deterministic, no
+# wall-clock assertions.
+# ---------------------------------------------------------------------------
+
+def test_realtime_factor_formula():
+    from voice.stt import _realtime_factor
+    # inference == audio -> realtime factor 1.0
+    assert _realtime_factor(3.0, 3.0) == 1.0
+    # faster than realtime
+    assert _realtime_factor(1.5, 3.0) == 0.5
+    # slower than realtime
+    assert _realtime_factor(6.0, 3.0) == 2.0
+    # zero/negative audio duration -> 0.0 (no divide-by-zero)
+    assert _realtime_factor(5.0, 0.0) == 0.0
+    assert _realtime_factor(5.0, -2.0) == 0.0
+    assert _realtime_factor(0.0, 0.0) == 0.0
+
+
+def test_wav_audio_duration_parsing():
+    from voice.stt import _buffer_to_mono16k_wav, _wav_audio_duration
+    # 320 samples at 16 kHz = 0.02 s
+    frame = _mk_frame(sample_rate=16000, channels=1, n=320)
+    wav = _buffer_to_mono16k_wav(frame)
+    assert abs(_wav_audio_duration(wav) - 0.02) < 1e-6
+
+
+def test_stt_completed_log_contains_latency_fields(caplog):
+    """Sanity: the timing log line is emitted with the expected fields."""
+    import logging
+    stt = _make_stt()
+    with caplog.at_level(logging.INFO, logger="voice.stt"):
+        _recognize_once(stt)
+    joined = "\n".join(r.message for r in caplog.records)
+    assert "STT started:" in joined
+    assert "STT completed:" in joined
+    assert "audio_duration=" in joined
+    assert "inference_time=" in joined
+    assert "realtime_factor=" in joined

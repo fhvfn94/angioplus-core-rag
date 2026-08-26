@@ -27,6 +27,8 @@ import io
 import logging
 import os
 import uuid
+import wave
+from time import perf_counter
 from typing import List
 
 import numpy as np
@@ -47,10 +49,47 @@ WHISPER_SAMPLE_RATE = 16000
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small").strip()
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu").strip()
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip()
-# Empty -> auto-detect audio language.
-STT_LANGUAGE = os.getenv("STT_LANGUAGE", "").strip()
-# Optional conditioning prompt for faster-whisper. Empty -> not passed.
-WHISPER_INITIAL_PROMPT = os.getenv("WHISPER_INITIAL_PROMPT", "").strip()
+# AngioPlus voice assistant is Russian-only: default to "ru" so faster-whisper
+# skips automatic language detection (extra latency/noise on short technical
+# phrases). Override with STT_LANGUAGE or an explicit .language argument.
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "ru").strip()
+
+# Concise AngioPlus vocabulary/context used as the faster-whisper initial
+# prompt. Conditioning on domain terminology biases the tokenizer toward the
+# correct medical spellings (катетер, μFR, ангиография, ...). This is
+# vocabulary/context assistance only, NOT medical advice. Override with
+# WHISPER_INITIAL_PROMPT; set WHISPER_INITIAL_PROMPT to empty to disable.
+DEFAULT_WHISPER_INITIAL_PROMPT = (
+    "AngioPlus Core, AngioPlus, PStation, катетер, калибровка катетера, "
+    "ангиография, коронарная артерия, стеноз, μFR, остаточный μFR, "
+    "виртуальный стент"
+)
+WHISPER_INITIAL_PROMPT = os.getenv(
+    "WHISPER_INITIAL_PROMPT", DEFAULT_WHISPER_INITIAL_PROMPT
+).strip()
+
+
+def _realtime_factor(inference_time: float, audio_duration: float) -> float:
+    """Ratio of inference wall-time to audio duration.
+
+    <1.0 means faster than realtime; >1.0 means slower than realtime.
+    Returns 0.0 when audio_duration is zero to avoid a division-by-zero.
+    """
+    if audio_duration <= 0:
+        return 0.0
+    return inference_time / audio_duration
+
+
+def _wav_audio_duration(wav_bytes: bytes) -> float:
+    """Audio duration in seconds for a PCM WAV buffer (stdlib `wave`)."""
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
+            rate = wav.getframerate()
+            if rate <= 0:
+                return 0.0
+            return wav.getnframes() / rate
+    except Exception:  # noqa: BLE001 - duration is best-effort timing metadata
+        return 0.0
 
 
 def _downmix_to_mono(frame: rtc.AudioFrame) -> rtc.AudioFrame:
@@ -201,9 +240,24 @@ class FasterWhisperSTT(STT):
         initial_prompt: str | None,
     ) -> str:
         """Blocking faster-whisper call. Run via asyncio.to_thread."""
+        # Model load is logged separately on the first (cold) call only, so the
+        # one-time download/init cost is visible apart from warm inference.
+        was_cold = not self.is_model_loaded
+        model_load_started = perf_counter()
         model = self._load_model()
+        model_load_seconds = perf_counter() - model_load_started
+
+        audio_duration = _wav_audio_duration(audio)
         wav = io.BytesIO(audio)
 
+        if was_cold:
+            logger.info("STT model loaded (cold): %.2fs", model_load_seconds)
+        logger.info(
+            "STT started: language=%s audio_duration=%.2fs",
+            language, audio_duration,
+        )
+
+        inference_started = perf_counter()
         segments, _info = model.transcribe(
             wav,
             language=language,
@@ -212,12 +266,20 @@ class FasterWhisperSTT(STT):
             best_of=1,
             temperature=0,
         )
+        inference_seconds = perf_counter() - inference_started
 
         transcription = "".join(segment.text for segment in segments).strip()
         if not transcription:
             raise ValueError(
                 "faster-whisper returned an empty transcription"
             )
+
+        realtime_factor = _realtime_factor(inference_seconds, audio_duration)
+        logger.info(
+            "STT completed: audio_duration=%.2fs inference_time=%.2fs "
+            "realtime_factor=%.2f",
+            audio_duration, inference_seconds, realtime_factor,
+        )
         return transcription
 
     # --- LiveKit STT hook ---------------------------------------------------

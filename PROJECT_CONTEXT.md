@@ -180,19 +180,41 @@ Needs additional regression testing.
 
 ## Voice
 
-Current transcription:
+### PRODUCTION (current live path)
 
-Gemini
+Transcription:
+
+Telegram voice -> Gemini transcription -> existing text RAG pipeline
 
 Configured with:
 
 GEMINI_AUDIO_MODEL=gemini-3.5-flash
 
-Potential future replacement:
-
-faster-whisper running locally.
-
 Server resource limits must be evaluated before adding another ML model because BGE-M3 already consumes significant RAM.
+
+### DEVELOPMENT BRANCH (feature/livekit-voice-agent, phase D1.x)
+
+Real microphone -> LiveKit Room -> Silero VAD -> faster-whisper -> transcript
+
+- Transcript is NOT connected to RAG yet (log-only FINAL_TRANSCRIPT).
+- TTS is NOT implemented. SIP is NOT implemented.
+- Uses local `faster-whisper` (model=small, device=cpu, compute_type=int8;
+  beam_size=1, best_of=1, temperature=0) with a Russian-only default
+  (`STT_LANGUAGE=ru`, skipping language auto-detection) and a concise
+  AngioPlus vocabulary `initial_prompt` (override via WHISPER_INITIAL_PROMPT;
+  set empty to disable).
+
+Current known quality/latency issue (real mic observed):
+- Russian transcription accuracy on short technical phrases is not yet good
+  enough (e.g. "Как выполнить калибровку катетера?" mistranscribed as
+  "выполнить стрелябровку качеры." etc.).
+- faster-whisper `small`/CPU/int8 is slower than realtime (Silero logs
+  "inference is slower than realtime", ~0.66 s delay) and several seconds of
+  total STT processing after an utterance.
+
+Phase D1.5 added a benchmark corpus (voice/stt_phrases.py) and a human-run
+STT benchmark helper (scripts/stt_benchmark.py) so accuracy and latency can be
+measured A/B against recorded WAV files instead of guessed.
 
 ## Current Server Constraints
 

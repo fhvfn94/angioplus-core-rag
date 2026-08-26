@@ -1,4 +1,4 @@
-# LiveKit voice component dependencies (Phase A + Phase B).
+# LiveKit voice component dependencies (Phase A + B + D1.3).
 #
 # Phase A boundary client:
 #   httpx  -> voice/rag_client.py (async HTTP transport for the RAG API)
@@ -7,11 +7,18 @@
 #   livekit-agents==1.7.0 -> the current 1.x framework (AgentServer /
 #     @rtc_session / WorkerOptions / JobContext). This is the base runtime; it
 #     pulls in its own core deps (av, sounddevice, openai, pydantic, etc.).
-#   No STT/TTS/plugin extras are required in Phase B (no speech yet).
+#
+# Phase D1.3 STT/VAD:
+#   livekit-plugins-silero -> official LiveKit Silero VAD plugin. It brings
+#     its own transitive deps (onnxruntime>=1.18, numpy>=1.26); onnxruntime is
+#     already present via faster-whisper. We intentionally do NOT pin those
+#     transitive deps ourselves.
 #
 # The pin matches the package actually installed and verified in this
 # environment.
 httpx>=0.27
 
 livekit-agents==1.7.0
+
+livekit-plugins-silero==1.7.0
 

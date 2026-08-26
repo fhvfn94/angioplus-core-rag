@@ -20,6 +20,7 @@ conversation memory stays in the existing RAG pipeline (app/).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from livekit import agents
@@ -82,6 +83,18 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         if not user_question.strip():
             return
 
+        # Identities only; we avoid logging full question text needlessly.
+        sender = (
+            packet.participant.identity
+            if packet.participant is not None
+            else _DEFAULT_USER_ID
+        )
+        logger.info(
+            "data_received: question from %s (%d bytes)",
+            sender,
+            len(payload),
+        )
+
         # Conversation memory stays in the RAG pipeline; we only forward the
         # caller (participant) identity so the RAG can scope per-conversation
         # memory. We prefix the per-room conversation id with the sender.
@@ -91,23 +104,27 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             else _DEFAULT_CONVERSATION_ID
         )
 
+        logger.info("RAG request started for %s", sender)
         try:
             answer = await _answer(
                 rag,
                 user_question,
                 conversation_id=conversation_id,
-                user_id=(
-                    packet.participant.identity
-                    if packet.participant is not None
-                    else _DEFAULT_USER_ID
-                ),
+                user_id=sender,
             )
         except RagClientError as exc:
-            logger.warning("RAG error for %r: %s", user_question, exc)
+            logger.warning("RAG error for %s: %s", sender, exc)
             answer = handle_rag_error(exc)
+        logger.info(
+            "RAG request completed for %s: answer %d bytes",
+            sender,
+            len(answer.encode("utf-8")),
+        )
 
         # Publish the answer back to the room as a data message.
-        ctx.room.local_participant.publish_data(
+        # NOTE: publish_data is a coroutine in the current livekit.rtc SDK;
+        # it must be awaited or the answer is silently never sent.
+        await ctx.room.local_participant.publish_data(
             answer.encode("utf-8"),
             destination_identities=(
                 [packet.participant.identity]
@@ -116,9 +133,31 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             ),
             reliable=True,
         )
+        logger.info("response published to %s", sender)
+
+    def _log_task_failure(task: asyncio.Task) -> None:
+        """Log any exception raised inside a background data-handling task."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "unhandled error in data_received handler: %r", exc,
+                exc_info=exc,
+            )
+
+    def _on_data_received(packet: DataPacket) -> None:
+        """Synchronous RTC callback for Room.on("data_received").
+
+        livekit.rtc Room.on() rejects async callbacks, so we register a
+        synchronous callback and schedule the async handler as a background
+        task, logging any internal failure so it is never silently lost.
+        """
+        task = asyncio.create_task(on_data_received(packet))
+        task.add_done_callback(_log_task_failure)
 
     # Data messages arrive on the Room, not on individual participants.
-    ctx.room.on("data_received", on_data_received)
+    ctx.room.on("data_received", _on_data_received)
 
     logger.info("agent ready: connected to %s, awaiting messages", ctx.room.name)
     # Keep the job alive; the server tears it down when participants leave.

@@ -28,3 +28,8 @@ data/processed/
 qdrant_storage/
 *.pyc
 .pytest_cache/
+
+# Local LiveKit voice worker logs (Phase C dev-time artifacts)
+litekit_agent*.log
+litekit_agent_err*.log
+litekit_agent_out*.log

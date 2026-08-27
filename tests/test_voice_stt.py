@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import io
 import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -30,6 +31,9 @@ class FakeWhisperModel:
     constructed = []  # reset per test
     segments = []  # reset per test
     raise_on_transcribe = None
+    # When > 0, transcribe() returns a *lazy* generator that sleeps this long
+    # per segment during iteration — modelling faster-whisper's lazy decoding.
+    lazy_sleep = 0.0
 
     def __init__(self, model, device, compute_type):
         self.model_arg = model
@@ -52,6 +56,17 @@ class FakeWhisperModel:
         self.calls.append(rec)
         if type(self).raise_on_transcribe is not None:
             raise type(self).raise_on_transcribe("boom")
+        if type(self).lazy_sleep > 0:
+            # A lazy generator: real "decoding" work happens only when the
+            # consumer iterates it (as with faster-whisper's generate_segments).
+            segs = type(self).segments
+
+            def _lazy():
+                for s in segs:
+                    time.sleep(type(self).lazy_sleep)
+                    yield s
+
+            return _lazy(), {"language": language}
         return iter(type(self).segments), {"language": language}
 
 
@@ -82,6 +97,7 @@ def _reset_fake():
         SimpleNamespace(text="."),
     ]
     FakeWhisperModel.raise_on_transcribe = None
+    FakeWhisperModel.lazy_sleep = 0.0
     yield
 
 
@@ -371,3 +387,81 @@ def test_stt_completed_log_contains_latency_fields(caplog):
     assert "audio_duration=" in joined
     assert "inference_time=" in joined
     assert "realtime_factor=" in joined
+
+
+# ---------------------------------------------------------------------------
+# Phase D1.5 follow-up regression tests: lazy segments generator timing
+# ---------------------------------------------------------------------------
+
+def _parse_latency(caplog):
+    """Return (inference_time, realtime_factor) from the STT completed log."""
+    for rec in caplog.records:
+        m = rec.getMessage()
+        if m.startswith("STT completed:"):
+            it = rt = None
+            for part in m.split():
+                if part.startswith("inference_time="):
+                    it = float(part.split("=")[1].rstrip("s"))
+                elif part.startswith("realtime_factor="):
+                    rt = float(part.split("=")[1])
+            return it, rt
+    raise AssertionError("STT completed log line not found")
+
+
+def test_inference_time_includes_lazy_segment_iteration(caplog):
+    """Regression: inference_time must include consuming the lazy segments
+    generator (the real faster-whisper decodes lazily during iteration).
+
+    The fake model's transcribe() returns a lazy generator that sleeps
+    `lazy_sleep` per segment only during iteration. An inference timer that
+    stopped right after transcribe() would report ~0.0s; the fixed timer must
+    report >= the total iteration work.
+    """
+    import logging
+    iter_sleep = 0.05
+    FakeWhisperModel.lazy_sleep = iter_sleep
+    FakeWhisperModel.segments = [
+        SimpleNamespace(text="A"), SimpleNamespace(text="B"),
+    ]
+    stt = _make_stt()
+
+    with caplog.at_level(logging.INFO, logger="voice.stt"):
+        _recognize_once(stt)
+    inference_time, realtime_factor = _parse_latency(caplog)
+
+    # Two segments x iter_sleep; be generous so this is never flaky, yet it
+    # would clearly fail if the timer stopped before iteration (~0.0s).
+    lower_bound = iter_sleep * len(FakeWhisperModel.segments) * 0.5
+    assert inference_time >= lower_bound, (
+        "inference_time did not include lazy segment iteration"
+    )
+    # RTF relationship must hold (complete transcription wall time / duration).
+    assert realtime_factor >= lower_bound / 0.02
+
+
+def test_cold_model_load_includes_slow_construction(caplog):
+    """Regression: cold model-load time is measured around the model factory,
+    so a slow construction must be captured (not trimmed away)."""
+    import logging
+
+    build_sleep = 0.1
+
+    def slow_factory(model, device, compute_type):
+        time.sleep(build_sleep)
+        return FakeWhisperModel(model, device, compute_type)
+
+    stt = FasterWhisperSTT(_model_factory=slow_factory)
+
+    with caplog.at_level(logging.INFO, logger="voice.stt"):
+        _recognize_once(stt)
+
+    cold_msg = None
+    for rec in caplog.records:
+        m = rec.getMessage()
+        if m.startswith("STT model loaded (cold):"):
+            cold_msg = m
+            break
+    assert cold_msg is not None, "cold model-load log line missing"
+    seconds = float(cold_msg.split(": ")[-1].rstrip("s"))
+    # Robust: must be at least the factory's own construction time.
+    assert seconds >= build_sleep * 0.5

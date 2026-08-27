@@ -258,6 +258,12 @@ class FasterWhisperSTT(STT):
         )
 
         inference_started = perf_counter()
+        # NOTE: faster-whisper's model.transcribe() returns a *lazy* segments
+        # generator: the real decoding happens only while the generator is
+        # consumed below. If the timer stopped right after transcribe() it
+        # would measure only setup (~0.3s) instead of the full transcription
+        # (~seconds). The timer therefore brackets BOTH transcribe() and the
+        # complete segment iteration/join.
         segments, _info = model.transcribe(
             wav,
             language=language,
@@ -266,9 +272,9 @@ class FasterWhisperSTT(STT):
             best_of=1,
             temperature=0,
         )
+        transcription = "".join(segment.text for segment in segments).strip()
         inference_seconds = perf_counter() - inference_started
 
-        transcription = "".join(segment.text for segment in segments).strip()
         if not transcription:
             raise ValueError(
                 "faster-whisper returned an empty transcription"

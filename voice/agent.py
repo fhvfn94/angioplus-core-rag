@@ -9,10 +9,16 @@ Phase B intent: prove that
   - this `voice` package stays isolated from the RAG pipeline (app.*) and
     from Qdrant.
 
-STT / TTS / SIP / telephony are intentionally NOT implemented yet. This agent
-is a *programmatic participant* (see
+Phase D2.1 connects the transcribed STT utterance to the existing RAG response
+path: each FINAL_TRANSCRIPT from the real-mic pipeline is sent to the RAG API
+(RagClient -> POST /ask) and the answer is published back to the room as a data
+message (destination = the speaking participant). TTS/SIP/telephony are still
+NOT implemented; the answer is delivered as text for now.
+
+This agent is a *programmatic participant* (see
 https://docs.livekit.io/agents/server/job/#entrypoint) — it does NOT create an
-AgentSession, so no speech models are required.
+AgentSession, so no speech models are required (STT/VAD are composed manually
+via voice/audio_transcriber.py).
 
 The ONLY knowledge/RAG boundary is voice.rag_client.RagClient -> POST /ask.
 No Qdrant access, no second RAG pipeline, no conversation-memory duplication:
@@ -22,8 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Optional
 
-from livekit import agents
+from livekit import agents, rtc
 from livekit.agents.worker import ServerType
 from livekit.rtc import DataPacket
 
@@ -64,71 +71,35 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # participant we control it explicitly).
     await ctx.connect()
 
-    # Real-mic STT/VAD integration (Phase D1.4): subscribe to any remote audio
-    # track and feed its AudioFrames through StreamAdapter(FasterWhisperSTT,
-    # Silero VAD), logging FINAL_TRANSCRIPT. A single AudioTrackListener owns
-    # one STT + VAD reused across utterances for this session (no per-utterance
-    # Whisper model rebuild). The transcript is only logged, not sent to RAG
-    # yet. The track callbacks are synchronous (EventEmitter rule) and schedule
-    # async work internally.
-    audio = AudioTrackListener()
-    ctx.room.on("track_subscribed", audio.on_track_subscribed)
-    ctx.room.on("track_unsubscribed", audio.on_track_unsubscribed)
-
-    def _on_room_disconnected(_reason) -> None:
-        """Cancel audio tasks on disconnect (synchronous callback)."""
-        cleanup = asyncio.create_task(audio.cancel_all())
-        cleanup.add_done_callback(_log_task_failure)
-
-    ctx.room.on("disconnected", _on_room_disconnected)
-
     rag = _make_rag_client()
 
-    async def on_data_received(packet: DataPacket) -> None:
-        """Handle an inbound text data message and answer via the RAG API.
+    def _conversation_id(participant: Optional[rtc.RemoteParticipant]) -> str:
+        """Scope RAG conversation memory per caller (participant identity)."""
+        if participant is not None:
+            return f"{ctx.room.name}:{participant.identity}"
+        return _DEFAULT_CONVERSATION_ID
 
-        Protocol: a remote participant publishes a data message whose payload
-        is the user's question text. This proves the RAG boundary works
-        end-to-end without any speech models.
+    async def _answer_and_publish(
+        question: str,
+        *,
+        participant: Optional[rtc.RemoteParticipant],
+    ) -> None:
+        """Ask RAG and publish the answer to the room (destination = caller).
+
+        Shared by the text data-message path and the D2.1 voice path so both
+        treat the question/transcript identically through the RAG boundary.
         """
-        payload = packet.data
-        if not payload:
-            return
-        if isinstance(payload, (bytes, bytearray)):
-            user_question = bytes(payload).decode("utf-8", errors="replace")
-        else:
-            user_question = payload
-
-        if not user_question.strip():
-            return
-
-        # Identities only; we avoid logging full question text needlessly.
         sender = (
-            packet.participant.identity
-            if packet.participant is not None
+            participant.identity
+            if participant is not None
             else _DEFAULT_USER_ID
         )
-        logger.info(
-            "data_received: question from %s (%d bytes)",
-            sender,
-            len(payload),
-        )
-
-        # Conversation memory stays in the RAG pipeline; we only forward the
-        # caller (participant) identity so the RAG can scope per-conversation
-        # memory. We prefix the per-room conversation id with the sender.
-        conversation_id = (
-            f"{ctx.room.name}:{packet.participant.identity}"
-            if packet.participant is not None
-            else _DEFAULT_CONVERSATION_ID
-        )
-
         logger.info("RAG request started for %s", sender)
         try:
             answer = await _answer(
                 rag,
-                user_question,
-                conversation_id=conversation_id,
+                question,
+                conversation_id=_conversation_id(participant),
                 user_id=sender,
             )
         except RagClientError as exc:
@@ -146,24 +117,49 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         await ctx.room.local_participant.publish_data(
             answer.encode("utf-8"),
             destination_identities=(
-                [packet.participant.identity]
-                if packet.participant is not None
+                [participant.identity]
+                if participant is not None
                 else []
             ),
             reliable=True,
         )
         logger.info("response published to %s", sender)
 
-    def _log_task_failure(task: asyncio.Task) -> None:
-        """Log any exception raised inside a background data-handling task."""
-        if task.cancelled():
+    # ------------------------------------------------------------------
+    # (A) Text data-message path (existing text E2E, unchanged behaviour)
+    # ------------------------------------------------------------------
+    async def _on_data_received_task(packet: DataPacket) -> None:
+        """Handle an inbound text data message via the RAG API.
+
+        Protocol: a remote participant publishes a data message whose payload
+        is the user's question text. This proves the RAG boundary works
+        end-to-end without any speech models.
+        """
+        payload = packet.data
+        if not payload:
             return
-        exc = task.exception()
-        if exc is not None:
-            logger.error(
-                "unhandled error in data_received handler: %r", exc,
-                exc_info=exc,
-            )
+        if isinstance(payload, (bytes, bytearray)):
+            user_question = bytes(payload).decode("utf-8", errors="replace")
+        else:
+            user_question = payload
+
+        if not user_question.strip():
+            return
+
+        sender = (
+            packet.participant.identity
+            if packet.participant is not None
+            else _DEFAULT_USER_ID
+        )
+        logger.info(
+            "data_received: question from %s (%d bytes)",
+            sender,
+            len(payload),
+        )
+        await _answer_and_publish(
+            user_question,
+            participant=packet.participant,
+        )
 
     def _on_data_received(packet: DataPacket) -> None:
         """Synchronous RTC callback for Room.on("data_received").
@@ -172,11 +168,54 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         synchronous callback and schedule the async handler as a background
         task, logging any internal failure so it is never silently lost.
         """
-        task = asyncio.create_task(on_data_received(packet))
-        task.add_done_callback(_log_task_failure)
+        _spawn(_on_data_received_task(packet))
 
     # Data messages arrive on the Room, not on individual participants.
     ctx.room.on("data_received", _on_data_received)
+
+    # ------------------------------------------------------------------
+    # (B) Real-mic voice path (Phase D1.4 STT/VAD + D2.1 RAG bridge)
+    # ------------------------------------------------------------------
+    def _on_voice_final(transcript: str, participant) -> None:
+        """D2.1 bridge: answer a spoken utterance via the existing RAG path.
+
+        The STT FINAL_TRANSCRIPT is attributed to the participant who spoke,
+        sent to the RAG API, and the answer is published back to that caller.
+        """
+        if not transcript or not transcript.strip():
+            return
+        # _spawn schedules the async "answer + publish" task and returns
+        # immediately, keeping this EventEmitter callback synchronous.
+        _spawn(_answer_and_publish(transcript, participant=participant))
+
+    def _spawn(coro) -> None:
+        """Run a coroutine as a background task, logging any failure."""
+        task = asyncio.create_task(coro)
+        task.add_done_callback(_log_task_failure)
+
+    def _log_task_failure(task: asyncio.Task) -> None:
+        """Log any exception raised inside a background handling task."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "unhandled error in agent handler: %r", exc,
+                exc_info=exc,
+            )
+
+    def _on_room_disconnected(_reason) -> None:
+        """Cancel audio tasks on disconnect (synchronous callback)."""
+        _spawn(audio.cancel_all())
+
+    # AudioTrackListener wires each FINAL_TRANSCRIPT to on_final, which now
+    # (D2.1) answers the transcript via RAG and publishes the answer back to
+    # the speaking participant. The track callbacks are synchronous
+    # (EventEmitter rule) and schedule async work internally.
+    audio = AudioTrackListener(on_final=_on_voice_final)
+    ctx.room.on("track_subscribed", audio.on_track_subscribed)
+    ctx.room.on("track_unsubscribed", audio.on_track_unsubscribed)
+    ctx.room.on("disconnected", _on_room_disconnected)
 
     logger.info("agent ready: connected to %s, awaiting messages", ctx.room.name)
     # Keep the job alive; the server tears it down when participants leave.

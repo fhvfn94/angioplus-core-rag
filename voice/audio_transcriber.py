@@ -1,15 +1,21 @@
 # -*- coding: utf-8 -*-
 """Real-mic -> LiveKit -> VAD -> faster-whisper -> transcript (Phase D1.4).
 
-This module contains only the audio-transcription integration. The pipeline
-proved here is:
+Phase D2.1 added the session-level `on_final` callback on AudioTrackListener.
+It lets the LiveKit voice agent subscribe to every transcribed utterance and
+send it onward (e.g. to the RAG response path), while keeping this module free
+of RAG / TTS / SIP / aiogram code. The callback receives the transcript text
+and the participant that produced it, so the agent can attribute and publish
+the answer back to the correct caller.
+
+Pipeline proved in D1.4 / D2.1:
 
     Windows microphone
       -> LiveKit Room (a remote participant's audio track is subscribed)
       -> Silero VAD            (voice.vad.load_vad)
       -> StreamAdapter          (livekit.agents.stt.StreamAdapter)
       -> FasterWhisperSTT       (voice.stt)
-      -> FINAL_TRANSCRIPT       (logged, not sent to RAG yet)
+      -> FINAL_TRANSCRIPT       (D2.1: forwarded to `on_final`, sent to RAG)
 
 Design constraints honored here:
     - LiveKit EventEmitter callbacks must stay synchronous. Async work is
@@ -128,7 +134,17 @@ class AudioTrackListener:
     A single STT + VAD is created lazily (on the first audio track) and reused
     for the whole session. The synchronous Room.on() handlers schedule async
     processing and clean up tasks when tracks are unsubscribed.
+
+    Phase D2.1: a session-level `on_final` callback
+    ``Callable[[str, object], None]`` receives every FINAL_TRANSCRIPT with its
+    producing participant. It is optional (default None); when set, each
+    per-track AudioTranscriber forwards transcripts through it with the
+    participant bound in, so the caller can attribute/publish the answer back.
     """
+
+    # Session-level transcript handler: called once per FINAL_TRANSCRIPT with
+    # the transcript text and the participant whose track produced it.
+    FinalHandler = Callable[[str, object], None]
 
     def __init__(
         self,
@@ -136,12 +152,14 @@ class AudioTrackListener:
         stt_factory: Optional[Callable[[], FasterWhisperSTT]] = None,
         vad_factory: Optional[Callable[[], object]] = None,
         audio_stream_factory: Optional[Callable] = None,
+        on_final: Optional["AudioTrackListener.FinalHandler"] = None,
     ) -> None:
         self._stt_factory = stt_factory or (lambda: FasterWhisperSTT())
         self._vad_factory = vad_factory or load_vad
         self._audio_stream_factory = (
             audio_stream_factory or rtc.AudioStream.from_track
         )
+        self._on_final = on_final
         self._stt: Optional[FasterWhisperSTT] = None
         self._vad: Optional[object] = None
         self._tasks: dict[str, asyncio.Task] = {}
@@ -171,7 +189,9 @@ class AudioTrackListener:
             return
         if track.sid in self._tasks:
             return
-        task = asyncio.create_task(self._process_track(track))
+        # Bind the producing participant so each transcript can be attributed
+        # to the caller who spoke it (Phase D2.1).
+        task = asyncio.create_task(self._process_track(track, participant))
         task.add_done_callback(
             lambda t: _log_task_failure(t, f"audio track {track.sid}")
         )
@@ -185,13 +205,20 @@ class AudioTrackListener:
         if task is not None:
             task.cancel()
 
-    async def _process_track(self, track) -> None:
+    async def _process_track(self, track, participant=None) -> None:
+        def _route_final(text: str) -> None:
+            # Keep the AudioTranscriber.on_final contract as a plain
+            # (str) -> None callback while attributing the participant here.
+            if self._on_final is not None:
+                self._on_final(text, participant)
+
         try:
             stt, vad = self._ensure_models()
             transcriber = AudioTranscriber(
                 track=track,
                 stt=stt,
                 vad=vad,
+                on_final=_route_final,
                 audio_stream_factory=self._audio_stream_factory,
             )
             await transcriber.run()

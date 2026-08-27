@@ -58,6 +58,12 @@ Telegram voice
 
 Voice transcription may later be migrated to a local Whisper/faster-whisper implementation.
 
+Development work on the `feature/livekit-voice-agent` branch replaces Gemini with
+a local pipeline (Silero VAD + faster-whisper) and, since phase D2.1, sends each
+transcribed utterance to the same RAG `/ask` endpoint and publishes the answer
+back to the call participant (as text/data; TTS not yet implemented). This is
+development work only, not yet the production voice path.
+
 ## Technology Stack
 
 - Python 3.12

@@ -385,3 +385,64 @@ def test_existing_rag_text_path_still_works():
     assert voice_agent.handle_rag_error(RagMalformedResponseError("m")) != ""
     # The conversation/answer helpers still exist.
     assert callable(voice_agent._answer)
+
+
+def _participant(identity="caller-1"):
+    return SimpleNamespace(identity=identity)
+
+
+def test_listener_on_final_receives_transcript_and_participant():
+    """Phase D2.1: per-track FINAL_TRANSCRIPT is routed to the session
+    `on_final(text, participant)` so the voice agent can answer the caller.
+
+    Uses the same fake STT / deterministic VAD / synthetic frames as the other
+    integration tests; the participant bound at subscribe time must reach the
+    session-level on_final callback together with the transcript text.
+    """
+    stt = _make_stt()
+    vad = DeterministicVAD()
+    seen = []
+    participant = _participant("voice-caller-1")
+
+    listener = AudioTrackListener(
+        stt_factory=lambda: stt,
+        vad_factory=lambda: vad,
+        audio_stream_factory=lambda *, track: _frame_source(count=3),
+        on_final=lambda text, who: seen.append((text, who)),
+    )
+
+    track = FakeAudioTrack(sid="a-D2")
+
+    async def run():
+        listener.on_track_subscribed(track, participant=participant)
+        # Let the processing task consume the synthetic frames and finish.
+        await asyncio.sleep(0.2)
+
+    asyncio.run(run())
+
+    assert len(seen) == 1
+    text, who = seen[0]
+    assert text == "Калибровка катетера"
+    # The participant that produced the audio is attributed to the transcript.
+    assert who is participant
+
+
+def test_listener_on_final_defaults_to_none():
+    """Backward compatibility: AudioTrackListener without on_final works."""
+    stt = _make_stt()
+    vad = DeterministicVAD()
+    listener = AudioTrackListener(
+        stt_factory=lambda: stt,
+        vad_factory=lambda: vad,
+        audio_stream_factory=lambda *, track: _frame_source(count=2),
+    )
+
+    track = FakeAudioTrack(sid="a-default")
+
+    async def run():
+        listener.on_track_subscribed(track, participant=_participant())
+        await asyncio.sleep(0.2)
+
+    asyncio.run(run())
+
+

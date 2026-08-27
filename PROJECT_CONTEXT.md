@@ -192,12 +192,21 @@ GEMINI_AUDIO_MODEL=gemini-3.5-flash
 
 Server resource limits must be evaluated before adding another ML model because BGE-M3 already consumes significant RAM.
 
-### DEVELOPMENT BRANCH (feature/livekit-voice-agent, phase D1.x)
+### DEVELOPMENT BRANCH (feature/livekit-voice-agent, phases D1.x / D2.1)
 
 Real microphone -> LiveKit Room -> Silero VAD -> faster-whisper -> transcript
+-> RAG /ask -> answer published back to the room (as text/data).
 
-- Transcript is NOT connected to RAG yet (log-only FINAL_TRANSCRIPT).
-- TTS is NOT implemented. SIP is NOT implemented.
+Phase D2.1 connected the transcribed utterance to the existing RAG response
+path: each FINAL_TRANSCRIPT is sent to POST /ask (via voice.rag_client) and the
+answer is published back to the speaking participant as a data message. The
+text data-message path and the voice path share one `_answer_and_publish`
+helper. `AudioTrackListener` gained an `on_final(text, participant)` session
+callback so the agent can attribute each spoken utterance to its caller.
+
+- Transcript IS now connected to RAG (voice -> /ask -> answer, delivered as
+  text/data). TTS is NOT yet implemented; the answer is not spoken yet.
+- SIP/telephony NOT implemented.
 - Uses local `faster-whisper` (model=small, device=cpu, compute_type=int8;
   beam_size=1, best_of=1, temperature=0) with a Russian-only default
   (`STT_LANGUAGE=ru`, skipping language auto-detection) and a concise

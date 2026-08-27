@@ -1,6 +1,6 @@
 # PROJECT CONTEXT — AngioPlus Core RAG
 
-Last updated: 2026-08
+Last updated: 2026-08 (D2.2)
 
 ## Purpose
 
@@ -225,6 +225,47 @@ Phase D1.5 added a benchmark corpus (voice/stt_phrases.py) and a human-run
 STT benchmark helper (scripts/stt_benchmark.py) so accuracy and latency can be
 measured A/B against recorded WAV files instead of guessed.
 
+### PHASE D2.2 — Qwen3-TTS 0.6B evaluation (ISOLATED PoC, NOT integrated)
+
+Qwen3-TTS is NOT yet connected to the voice assistant. This phase only
+prepares an isolated proof-of-concept to decide whether Qwen3-TTS 0.6B is
+suitable as the future TTS engine BEFORE wiring TTS into LiveKit.
+
+- Production/current voice path remains:
+  microphone -> LiveKit -> Silero -> faster-whisper -> RAG -> text/data response
+- TTS -> LiveKit is NOT implemented yet.
+- Official model verified upstream: `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`
+  (license: apache-2.0). Python package: `qwen-tts`.
+- New isolated artifacts (do not touch the LiveKit/STT/VAD/RAG pipeline):
+  - `voice/tts_phrases.py` — AngioPlus Russian TTS evaluation phrase set
+    (short / normal / long buckets; exercises AngioPlus, AngioPlus Core,
+    PStation, μFR, катетер, калибровка, ангиография, коронарная артерия,
+    стеноз, виртуальный стент).
+  - `scripts/qwen_tts_poc.py` — human-run PoC:
+    text -> Qwen3-TTS 0.6B -> Russian -> WAV, with latency/resource measurements.
+  - `requirements-qwen-tts.txt` — ISOLATED dependency file. DO NOT install into
+    the shared `.venv`: qwen-tts==0.1.1 pins transformers==4.57.3, conflicting
+    with the project's pinned transformers==4.57.6.
+- Streaming/TTFA: the official high-level `generate_custom_voice()` Python API
+  is non-streaming at this level (returns a complete wavs,sr tuple), so true
+  TTFA cannot yet be measured; streaming would need the lower-level Dual-Track
+  path (out of scope here). This is reported honestly, not faked.
+- Tests: `tests/test_qwen_tts_poc.py` (mocks / never downloads the model).
+
+### ENVIRONMENT / COMPATIBILITY (recorded 2026-08)
+
+- Local dev machine: Windows 11, AMD Ryzen 7 7730U, 15.3 GB RAM, NO CUDA GPU
+  (torch sees torch.cuda.is_available() == False; integrated Radeon).
+- Project venv: Python 3.14.3, torch 2.13.0+cpu, transformers 4.57.6,
+  numpy 2.5.1, scipy 1.18.0. qwen-tts / librosa / soundfile are NOT installed
+  in the shared venv and must not be added there.
+- Qwen3-TTS officially recommends a fresh Python 3.12 environment and a CUDA
+  GPU for reasonable speed. CPU-only execution is possible but expected to be
+  slow; the manual test must be done in an isolated venv (see
+  requirements-qwen-tts.txt). No Qwen model has been downloaded yet in D2.2;
+  the human must consciously run `scripts/qwen_tts_poc.py` (or a manual HF
+  download) in the isolated env after the PoC was prepared.
+
 ## Current Server Constraints
 
 Server is small:
@@ -338,6 +379,8 @@ Recommended priority:
 4. Measure whether DeepSeek gate can safely be removed/merged.
 5. Evaluate local faster-whisper for voice transcription.
 6. Consider hybrid retrieval/reranking only after measured retrieval failures.
+7. Complete the D2.2 manual Qwen3-TTS 0.6B PoC run (isolated venv) and decide
+   whether to proceed toward TTS -> LiveKit integration.
 
 ## Instructions for AI Coding Agent
 

@@ -1,0 +1,26 @@
+# Phase D2.2 — ISOLATED Qwen3-TTS PoC dependencies.
+#
+# IMPORTANT: do NOT `pip install -r requirements-qwen-tts.txt` into the shared
+# project venv (.venv). qwen-tts==0.1.1 pins `transformers==4.57.3` exactly,
+# which conflicts with the production stack's pinned `transformers==4.57.6`
+# (requirements-ml.txt + requirements-constraints.txt). Installing it into the
+# shared venv would downgrade transformers and risk the BGE-M3 / RAG /
+# faster-whisper stack.
+#
+# Recommended use (fresh, ISOLATED virtual environment for the manual PoC):
+#
+#   py -3.12 -m venv .venv-qwen
+#   .\.venv-qwen\Scripts\python.exe -m pip install --upgrade pip
+#   .\.venv-qwen\Scripts\python.exe -m pip install -r requirements-qwen-tts.txt
+#
+# Official upstream guidance also recommends a fresh Python 3.12 environment:
+#   https://github.com/QwenLM/Qwen3-TTS (Quickstart -> Environment Setup)
+#
+# CPU note: the official package works on CPU but the docs/examples target a
+# CUDA GPU (`device_map="cuda:0"`, dtype=torch.bfloat16,
+# attn_implementation="flash_attention_2"). On this machine there is no CUDA
+# GPU (torch sees `torch.cuda.is_available() == False`), so CPU execution is
+# the only option and is expected to be slow. The PoC CLI accepts a normal
+# CPU load (dtype=torch.float32, device cpu) for this reason.
+
+qwen-tts==0.1.1

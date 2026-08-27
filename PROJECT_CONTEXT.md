@@ -1,6 +1,6 @@
 # PROJECT CONTEXT — AngioPlus Core RAG
 
-Last updated: 2026-08 (D2.2)
+Last updated: 2026-08 (D2.2b)
 
 ## Purpose
 
@@ -252,6 +252,100 @@ suitable as the future TTS engine BEFORE wiring TTS into LiveKit.
   path (out of scope here). This is reported honestly, not faked.
 - Tests: `tests/test_qwen_tts_poc.py` (mocks / never downloads the model).
 
+### PHASE D2.2b — Qwen3-TTS architecture decision (RESEARCH, verified upstream)
+
+RESEARCH-ONLY conclusion. No TTS change has been wired into LiveKit/voice;
+the STT/VAD/RAG path is untouched. The following was verified by reading the
+official `QwenLM/Qwen3-TTS` source (`qwen_tts` package, v0.1.1), the official
+README, the official vLLM-Omni README section, and the Aliyun DashScope
+model-studio real-time API docs. CPU synthesis quality is ACCEPTED; CPU
+latency is NOT accepted (see numbers below), so we proceed to GPU.
+
+VERIFIED STREAMING FACTS (from source, not marketing):
+- The open-source `qwen-tts` Python package does NOT expose true streaming
+  AUDIO output for ANY `generate_*` method, including `generate_custom_voice()`
+  used by our 0.6B-CustomVoice checkpoint. Every `generate_*` returns a
+  complete `(wavs, sr)` tuple only.
+- The `non_streaming_mode` parameter on `generate_custom_voice() /
+  generate_voice_design() / generate_voice_clone()` only changes how TEXT is
+  fed into the prompt (default `True` = whole-text input). The docstring states
+  explicitly it "only simulates streaming text input when set to false, rather
+  than enabling true streaming input or streaming generation." It does NOT
+  change audio output to a stream.
+- The underlying `Qwen3TTSForConditionalGeneration.generate(...)` runs the
+  whole autoregressive codec decode then decodes ALL codes at once; no
+  per-chunk audio yield exists in the local package.
+- TRUE streaming ("Dual-Track hybrid", ~97 ms first-audio claim) is real but
+  currently exposed ONLY through Aliyun's DASHSCOPE HOSTED realtime WebSocket
+  API (`qwen3-tts-flash-realtime` / `qwen3-tts-instruct-flash-realtime`,
+  `response.audio.delta` events). It is NOT self-hostable from the open-source
+  package today without reimplementing the streaming loop.
+- vLLM (vLLM-Omni) officially supports Qwen3-TTS "day-0", but the official
+  README states it currently supports ONLY OFFLINE inference; online serving
+  and streaming are explicitly "will be supported later". So vLLM is NOT yet a
+  streaming path for us.
+- 0.6B-CustomVoice does NOT support instruction control either: source forces
+  `instruct=None` for `tts_model_size in "0b6"` (only 1.7B-CustomVoice supports
+  instruct). This is expected and unrelated to our greeting/QA phrasing.
+
+VERIFIED MODEL / HARDWARE FACTS:
+- Config confirms 0.6B (talker: hidden 1024, 28 layers, 16 heads / GQA 8 KV,
+  SwiGLU; code predictor: 5 layers). bf16 weights ~= 1.2-1.6 GB; with activations
+  + KV cache the model fits comfortably in an 8 GB GPU in bf16. So 8 GB is the
+    practical footprint for inference; 12-16 GB gives headroom.
+- Model supports flash_attn_2, SDPA, flex_attn AND eager attention
+  (`_supports_flash_attn/_supports_sdpa/_supports_flex_attn = True`; default
+  `eager_attention_forward`). FlashAttention-2 is RECOMMENDED but NOT required;
+  consumer GPUs can run eager/SDPA without installing flash-attn.
+- FlashAttention-2 requires FP16/BF16 and NVIDIA Ampere+ (or compatible). On
+  Windows flash-attn requires a prebuilt wheel / CUDA toolchain; it is easier
+  on Linux CUDA. CPU path already verified slow (below).
+- transformers is pinned `==4.57.3` by `qwen-tts==0.1.1`, conflicting with the
+  project's pinned `transformers==4.57.6`. TTS must stay dependency-isolated.
+
+RECORDED CPU MEASUREMENT (this machine, warm cache, no GPU):
+- model load ~20.7 s; synthesis ~33.65 s for ~3.76 s audio -> RTF ~8.95,
+  RAM ~4.5 GB, device cpu. Quality accepted; latency NOT accepted.
+
+INFERENCE ARCHITECTURE CHOICE (decision):
+- TODAY: use direct PyTorch/CUDA inference via the `qwen-tts` package
+  (`Qwen3TTSModel`, bf16, cuda, optional SDPA/eager) in a SEPARATE dedicated
+  TTS inference service, isolated from the voice-agent process. Non-streaming
+  per-utterance synthesis is the only locally verified path; it is fine for
+  MVP because our RAG answer comes back complete before we speak.
+- True streaming / barge-in: NOT available from the self-hosted open-source
+  stack today. If low TTFA streaming becomes mandatory, re-evaluate Aliyun
+  DashScope realtime (hosted, latency-sensitive, data leaves device) OR await
+  vLLM-Omni online/streaming support. This is a later decision, NOT D2.3.
+- vLLM-Omni offline inference is kept as a faster batch alternative; not the
+  production path until online/streaming ships.
+- TTS MUST be a separate service because of the transformers pin conflict and
+  so its CUDA/bfloat16 runtime does not destabilize the STT/VAD/RAG process.
+
+RECOMMENDED GPU:
+- Development minimum: an NVIDIA RTX 4060 Ti 16 GB (or 3060 12 GB) is enough
+  to run 0.6B in bf16 with headroom; 8 GB (e.g. 3070/4060) likely enough to
+  just load and run but tight. Recommend 16 GB for dev comfort.
+- Production: a single NVIDIA Ada/Ampere 16-24 GB card (e.g. RTX 4090, RTX
+  A4500/A5000, or L4 24 GB) is far more than needed for 0.6B and gives huge
+  latency headroom; a 12-16 GB card is the sensible sweet spot for this
+  checkpoint. We care about latency, not batch throughput.
+- Cloud first is recommended: rent an NVIDIA L4 24 GB or an RTX A6000/4090 24 GB
+  GPU instance (or a 16 GB A10G) for a real GPU benchmark before buying.
+
+PROPOSED LATENCY TARGETS:
+- Warm model required (load ~1-3 s on NVMe + GPU; keep process alive).
+- acceptable MVP: TTS TTFA <= 1.5 s; TTS RTF <= 0.5; total FINAL_TRANSCRIPT ->
+  first spoken audio <= 3.5 s.
+- good production target: TTS TTFA <= 0.5 s; TTS RTF <= 0.1-0.2;
+  total <= 2.0 s.
+- These are targets pending a real GPU benchmark; not verified numbers yet.
+
+NEXT (do NOT start D2.3): run `scripts/qwen_tts_poc.py` on a rented CUDA GPU
+(eager/SDPA first, then flash-attn) to measure load time, synthesis RTF, actual
+VRAM, and confirm bf16. Then measure end-to-end FINAL_TRANSCRIPT -> first audio
+with a NON-STREAMING integration before considering a streaming path.
+
 ### ENVIRONMENT / COMPATIBILITY (recorded 2026-08)
 
 - Local dev machine: Windows 11, AMD Ryzen 7 7730U, 15.3 GB RAM, NO CUDA GPU
@@ -379,8 +473,11 @@ Recommended priority:
 4. Measure whether DeepSeek gate can safely be removed/merged.
 5. Evaluate local faster-whisper for voice transcription.
 6. Consider hybrid retrieval/reranking only after measured retrieval failures.
-7. Complete the D2.2 manual Qwen3-TTS 0.6B PoC run (isolated venv) and decide
-   whether to proceed toward TTS -> LiveKit integration.
+7. After D2.2b (architecture decided, CPU rejected): run the Qwen3-TTS 0.6B
+   PoC on a rented CUDA GPU (eager/SDPA, then flash-attn) to benchmark load
+   time, synthesis RTF, and real VRAM in bf16, then measure end-to-end
+   FINAL_TRANSCRIPT -> first audio with a NON-STREAMING TTS integration. Do NOT
+   start D2.3 (streaming/barge-in) until the non-streaming GPU path is proven.
 
 ## Instructions for AI Coding Agent
 

@@ -60,6 +60,97 @@ logger = logging.getLogger(__name__)
 _DEFAULT_CONVERSATION_ID = "livekit-voice"
 _DEFAULT_USER_ID = "livekit-voice-user"
 
+# Temporal turn aggregation: Silero/Whisper may split one spoken turn into
+# multiple FINAL_TRANSCRIPT events. Fragments from the same participant that
+# arrive within this window are combined and sent to RAG exactly once.
+VOICE_TURN_DEBOUNCE_SECONDS = 0.8
+
+
+def _new_voice_state() -> dict:
+    """A single participant's pending-turn state in the debouncer."""
+    return {"text": "", "task": None, "generation": 0}
+
+
+class _VoiceTurnDebouncer:
+    """Per-participant temporal turn aggregation for FINAL_TRANSCRIPT.
+
+    Multiple FINAL_TRANSCRIPT events describing one spoken turn (as when
+    Silero/Whisper splits an utterance) are concatenated and handed to RAG
+    exactly once, ``debounce_seconds`` after the most recent fragment. This is
+    purely temporal turn aggregation: no punctuation/word heuristics.
+
+    Concurrency: each flush task carries the participant's generation at the
+    time it was scheduled. A cancelled (or just-woken) task belonging to an
+    older generation never deletes/flushes state that a newer turn owns.
+    """
+
+    def __init__(self, *, debounce_seconds=VOICE_TURN_DEBOUNCE_SECONDS,
+                 spawn=None, log_failure=None):
+        self._debounce = debounce_seconds
+        self._spawn = spawn or (
+            lambda coro: asyncio.get_event_loop().create_task(coro)
+        )
+        self._log_failure = log_failure
+        # identity -> _new_voice_state() entry
+        self._states: dict[str, dict] = {}
+
+    def submit(self, transcript, participant, flush) -> None:
+        """Buffer ``transcript`` for ``participant`` and schedule a flush.
+
+        ``flush`` is an async callable ``(combined_text, participant)`` invoked
+        exactly once after the debounce window (or immediately when there is
+        no stable participant identity to aggregate on).
+        """
+        text = (transcript or "").strip()
+        if not text:
+            return
+        identity = getattr(participant, "identity", None)
+        if not identity:
+            # No stable identity -> cannot aggregate; preserve old behaviour.
+            self._spawn(flush(text, participant))
+            return
+
+        state = self._states.setdefault(identity, _new_voice_state())
+        state["text"] = (
+            (state["text"] + " " + text).strip() if state["text"] else text
+        )
+        # Bump generation so any older timer is invalidated (owning older
+        # state is superseded).
+        state["generation"] += 1
+        generation = state["generation"]
+
+        old = state["task"]
+        if old is not None and not old.done():
+            old.cancel()
+
+        async def _run(pid, gen, participant_ref):
+            try:
+                await asyncio.sleep(self._debounce)
+                cur = self._states.get(pid)
+                if cur is None or cur["generation"] != gen:
+                    return  # superseded by a newer turn / already flushed
+                self._states.pop(pid, None)
+                combined = cur["text"]
+            except asyncio.CancelledError:
+                return  # never flush a cancelled timer
+            await flush(combined, participant_ref)
+
+        task = self._spawn(_run(identity, generation, participant))
+        if self._log_failure is not None:
+            task.add_done_callback(self._log_failure)
+        state["task"] = task
+
+    def flush_all(self) -> None:
+        """Cancel every pending debounce timer (session/job shutdown)."""
+        for identity in list(self._states):
+            state = self._states.pop(identity, None)
+            if state and state["task"] and not state["task"].done():
+                state["task"].cancel()
+
+    def pending_count(self) -> int:
+        """Number of participants with pending (unflushed) turns."""
+        return len(self._states)
+
 
 def _make_rag_client() -> RagClient:
     """Build the single RAG boundary client from the environment."""
@@ -222,16 +313,22 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # (B) Real-mic voice path (Phase D1.4 STT/VAD + D2.1 RAG bridge)
     # ------------------------------------------------------------------
     def _on_voice_final(transcript: str, participant) -> None:
-        """D2.1 bridge: answer a spoken utterance via the existing RAG path.
+        """D2.1 bridge + temporal turn debounce.
 
-        The STT FINAL_TRANSCRIPT is attributed to the participant who spoke,
-        sent to the RAG API, and the answer is published back to that caller.
+        The STT FINAL_TRANSCRIPT is attributed to the participant who spoke.
+        Because Silero/Whisper can split one spoken turn into several
+        FINAL_TRANSCRIPT events, fragments from the same participant are
+        buffered in ``voice_debouncer`` and the combined text is sent to RAG
+        exactly once, VOICE_TURN_DEBOUNCE_SECONDS after the last fragment.
+        Purely temporal aggregation: no punctuation/word heuristics.
+
+        Kept synchronous (EventEmitter rule): the debouncer schedules its own
+        timer tasks and returns immediately.
         """
-        if not transcript or not transcript.strip():
-            return
-        # _spawn schedules the async "answer + publish" task and returns
-        # immediately, keeping this EventEmitter callback synchronous.
-        _spawn(_answer_and_publish(transcript, participant=participant))
+        async def _flush(text: str, participant_ref) -> None:
+            await _answer_and_publish(text, participant=participant_ref)
+
+        voice_debouncer.submit(transcript, participant, _flush)
 
     def _spawn(coro) -> None:
         """Run a coroutine as a background task, logging any failure."""
@@ -251,6 +348,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     def _on_room_disconnected(_reason) -> None:
         """Cancel audio tasks on disconnect (synchronous callback)."""
+        # Cancel any pending voice-turn debounce timers on session shutdown.
+        voice_debouncer.flush_all()
         _spawn(audio.cancel_all())
 
     # AudioTrackListener wires each FINAL_TRANSCRIPT to on_final, which now
@@ -258,6 +357,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # the speaking participant. The track callbacks are synchronous
     # (EventEmitter rule) and schedule async work internally.
     audio = AudioTrackListener(on_final=_on_voice_final)
+    # Per-participant temporal turn debounce for the voice path.
+    voice_debouncer = _VoiceTurnDebouncer(
+        debounce_seconds=VOICE_TURN_DEBOUNCE_SECONDS,
+        spawn=_spawn,
+        log_failure=_log_task_failure,
+    )
     ctx.room.on("track_subscribed", audio.on_track_subscribed)
     ctx.room.on("track_unsubscribed", audio.on_track_unsubscribed)
     ctx.room.on("disconnected", _on_room_disconnected)

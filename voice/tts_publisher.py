@@ -86,7 +86,7 @@ async def publish_tts_audio(
     )
 
     for frame in pcm_to_frames(audio.pcm_bytes, audio.sample_rate):
-        source.capture_frame(frame)
-    source.flush()
+        await source.capture_frame(frame)
+    
 
     return publication

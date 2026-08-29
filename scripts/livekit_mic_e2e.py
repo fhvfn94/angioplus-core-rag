@@ -30,7 +30,8 @@ import os
 import signal
 
 from livekit import rtc
-from livekit.rtc import LocalAudioTrack
+from livekit.rtc import LocalAudioTrack, TrackKind
+from livekit.rtc.media_devices import OutputPlayer
 
 logger = logging.getLogger("mic-e2e")
 
@@ -73,7 +74,63 @@ async def main() -> None:
     print(f"[mic-e2e] connecting to {url} room={room_name!r} ...")
     room = rtc.Room()
     await room.connect(url, token)
-    print(f"[mic-e2e] connected as participant {room.local_participant.identity!r}")
+    print(
+        f"[mic-e2e] connected as participant {room.local_participant.identity!r}"
+    )
+
+    # ----------------------------------------------------------------------
+    # Playback: route remote audio tracks (e.g. the worker's tts-answer) to the
+    # default Windows output device. OutputPlayer wraps sounddevice internally,
+    # uses output_device=None (=> default device => realme Buds Air 5) and mixes
+    # all added remote tracks together.
+    # ----------------------------------------------------------------------
+    player = OutputPlayer()
+    await player.start()
+    print("[mic-e2e] output playback started on the default Windows audio device")
+
+    # Track bookkeeping so each remote track is only handled/played once.
+    _play_tasks: dict[str, asyncio.Task] = {}
+
+    def _on_track_subscribed(track, publication, participant) -> None:
+        """Synchronous Room.on("track_subscribed"): play remote AUDIO tracks."""
+        if getattr(track, "kind", None) != TrackKind.KIND_AUDIO:
+            return
+        if track.sid in _play_tasks:
+            return
+        _play_tasks[track.sid] = asyncio.create_task(
+            _play_remote_audio(track)
+        )
+
+    def _on_track_unsubscribed(track, publication, participant) -> None:
+        task = _play_tasks.pop(track.sid, None)
+        if task is not None:
+            task.cancel()
+
+    async def _play_remote_audio(track) -> None:
+        """Add the remote audio track to the OutputPlayer for playback."""
+        try:
+            await player.add_track(track)
+            logger.info(
+                "playing remote audio track %s on output device", track.sid
+            )
+            # OutputPlayer.add_track creates its own AudioStream routed into the
+            # internal mixer. Keep the task alive until unsubscribe/shutdown.
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "playback for remote track %s failed: %r", track.sid, exc
+            )
+        finally:
+            _play_tasks.pop(track.sid, None)
+
+    # Subscribe to remote tracks. LiveKit auto-subscribes all remote tracks, so
+    # this fires for tracks published either before or after we connected. Our
+    # own published mic comes back as a LOCAL track subscription, not a remote
+    # "track_subscribed", so we never play our own microphone back.
+    room.on("track_subscribed", _on_track_subscribed)
+    room.on("track_unsubscribed", _on_track_unsubscribed)
 
     # Media device capture -> rtc.AudioSource -> LocalAudioTrack -> publish.
     media_devices = rtc.media_devices.MediaDevices()
@@ -121,6 +178,13 @@ async def main() -> None:
         pass
     finally:
         print("[mic-e2e] shutting down ...")
+        # Cancel any pending playback tasks / stop the output player.
+        for task in list(_play_tasks.values()):
+            task.cancel()
+        try:
+            await player.aclose()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("output player close failed: %s", exc)
         try:
             await room.local_participant.unpublish_track(publication.sid)
         except Exception as exc:  # noqa: BLE001
@@ -136,3 +200,4 @@ async def main() -> None:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
+

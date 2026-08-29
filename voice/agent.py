@@ -12,8 +12,15 @@ Phase B intent: prove that
 Phase D2.1 connects the transcribed STT utterance to the existing RAG response
 path: each FINAL_TRANSCRIPT from the real-mic pipeline is sent to the RAG API
 (RagClient -> POST /ask) and the answer is published back to the room as a data
-message (destination = the speaking participant). TTS/SIP/telephony are still
-NOT implemented; the answer is delivered as text for now.
+message (destination = the speaking participant).
+
+Phase D2.3 adds the FIRST voice-to-voice link: after the RAG answer is sent as
+text/data, the same answer is synthesized by a REMOTE Qwen3-TTS HTTP service
+(voice.tts_client -> scripts/tts_server.py on a GPU) and the resulting audio is
+published into the room as a spoken track (voice.tts_publisher). TTS is
+OPTIONAL and OFF by default: it is enabled only when TTS_BASE_URL is set, so the
+existing text/data-only path keeps working when no GPU TTS is reachable. SIP /
+telephony / streaming / barge-in are intentionally NOT implemented.
 
 This agent is a *programmatic participant* (see
 https://docs.livekit.io/agents/server/job/#entrypoint) — it does NOT create an
@@ -35,7 +42,7 @@ from livekit.agents.worker import ServerType
 from livekit.rtc import DataPacket
 
 from voice.audio_transcriber import AudioTrackListener
-from voice.config import load_rag_config
+from voice.config import load_rag_config, load_tts_config
 from voice.rag_client import (
     RagClient,
     RagClientError,
@@ -43,6 +50,8 @@ from voice.rag_client import (
     RagMalformedResponseError,
     RagTimeoutError,
 )
+from voice.tts_client import TTSClient, TTSClientError
+from voice.tts_publisher import publish_tts_audio
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +70,34 @@ def _make_rag_client() -> RagClient:
     return RagClient(url=cfg.url, timeout_seconds=cfg.timeout_seconds)
 
 
+def _make_tts_client() -> TTSClient | None:
+    """Build the remote Qwen3-TTS HTTP client, or None when TTS is disabled.
+
+    TTS is OFF unless TTS_BASE_URL is set in the environment (the Vast IP is
+    intentionally never hardcoded). When disabled, the voice worker falls back
+    to the existing text/data-only answer path (Phase D2.1).
+    """
+    cfg = load_tts_config()
+    if not cfg.enabled:
+        logger.info(
+            "TTS disabled (TTS_BASE_URL not set); replies delivered as "
+            "text/data only"
+        )
+        return None
+    logger.info(
+        "TTS boundary configured at %s (speaker=%s language=%s timeout=%ss "
+        "out_rate=%d)", cfg.base_url, cfg.speaker, cfg.language,
+        cfg.timeout_seconds, cfg.sample_rate,
+    )
+    return TTSClient(
+        base_url=cfg.base_url,
+        speaker=cfg.speaker,
+        language=cfg.language,
+        timeout_seconds=cfg.timeout_seconds,
+        sample_rate=cfg.sample_rate,
+    )
+
+
 async def entrypoint(ctx: agents.JobContext) -> None:
     """Run once per job: connect to the room and act as a programmatic
     participant that answers textual messages via the existing RAG API."""
@@ -72,6 +109,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     await ctx.connect()
 
     rag = _make_rag_client()
+    # Remote GPU TTS client (None when TTS_BASE_URL is unset -> text-only).
+    tts = _make_tts_client()
 
     def _conversation_id(participant: Optional[rtc.RemoteParticipant]) -> str:
         """Scope RAG conversation memory per caller (participant identity)."""
@@ -124,6 +163,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             reliable=True,
         )
         logger.info("response published to %s", sender)
+
+        # D2.3: if a remote GPU TTS service is configured, speak the answer
+        # into the room so the caller hears it. Text stays published above for
+        # debugging. A TTS failure must NOT break the text answer already sent.
+        if tts is not None:
+            await _speak_answer(tts, ctx.room.local_participant, answer)
 
     # ------------------------------------------------------------------
     # (A) Text data-message path (existing text E2E, unchanged behaviour)
@@ -251,6 +296,29 @@ def handle_rag_error(exc: RagClientError) -> str:
     if isinstance(exc, RagMalformedResponseError):
         return "Сервис вернул некорректный ответ. Попробуйте ещё раз."
     return "Не удалось получить ответ. Попробуйте ещё раз."
+
+
+async def _speak_answer(tts: TTSClient, participant: rtc.LocalParticipant,
+                        text: str) -> None:
+    """Synthesize ``text`` via the remote TTS service and publish it to the room.
+
+    A remote-TTS failure is caught and logged so it never breaks the LiveKit
+    worker or the already-sent text/data reply (Phase D2.3 semantics).
+    """
+    try:
+        audio = await tts.synthesize(text)
+    except TTSClientError as exc:
+        logger.warning("TTS request failed for answer: %s", exc)
+        return
+    except ValueError as exc:  # e.g. empty text
+        logger.warning("TTS skipped for empty text: %s", exc)
+        return
+
+    logger.info(
+        "TTS synthesized answer: %.2fs at %d Hz",
+        audio.duration_seconds, audio.sample_rate,
+    )
+    await publish_tts_audio(participant, audio)
 
 
 # ---------------------------------------------------------------------------

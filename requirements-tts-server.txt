@@ -1,0 +1,26 @@
+# Isolated dependency file for the Qwen3-TTS HTTP server (Phase D2.3).
+#
+# INSTALL ON THE REMOTE GPU (Vast.ai) IN A FRESH VENV ONLY. Do NOT install
+# into the local shared project venv (.venv): qwen-tts==0.1.1 pins
+# transformers==4.57.3, which conflicts with the project's pinned
+# transformers==4.57.6 (requirements-ml.txt / requirements-constraints.txt).
+#
+# A CUDA build of torch is assumed already present on the rented GPU (Vast.ai
+# images ship with CUDA torch by default; if not, `nvidia/pytorch` or a
+# `pip install torch --index-url https://download.pytorch.org/whl/cu124`
+# is required). FlashAttention is NOT required (the server uses SDPA).
+
+# Qwen3-TTS official package (pulls transformers==4.57.3, torch, etc).
+qwen-tts==0.1.1
+
+# HTTP server (FastAPI + uvicorn). These do NOT conflict with transformers;
+# they bring their own lightweight deps.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+
+# Only used by the local client (voice/tts_client.py) on the Windows PC:
+# numpy + httpx are already present in the shared livekit venv, but list them
+# here as explicit documentation for the remote side is optional. Keeping them
+# uncommented is harmless inside the isolated venv.
+numpy>=1.26,<3
+httpx>=0.27

@@ -26,9 +26,9 @@ require FlashAttention (works with eager/SDPA on consumer GPUs without the
 flash-attn build headache).
 
 Usage on Vast.ai (inside the isolated venv):
-    python scripts/tts_server.py
+    python scripts/tts/tts_server.py
     # or with uvicorn reload/workers
-    uvicorn scripts.tts_server:app --host 0.0.0.0 --port 8001
+    uvicorn scripts.tts.tts_server:app --host 0.0.0.0 --port 8001
 
 Minimal health check:
     curl http://<container-ip>:8001/tts \

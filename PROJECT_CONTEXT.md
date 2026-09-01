@@ -222,7 +222,7 @@ Current known quality/latency issue (real mic observed):
   total STT processing after an utterance.
 
 Phase D1.5 added a benchmark corpus (voice/stt_phrases.py) and a human-run
-STT benchmark helper (scripts/stt_benchmark.py) so accuracy and latency can be
+STT benchmark helper (scripts/stt/stt_benchmark.py) so accuracy and latency can be
 measured A/B against recorded WAV files instead of guessed.
 
 ### PHASE D2.2 — Qwen3-TTS 0.6B evaluation (ISOLATED PoC, NOT integrated)
@@ -241,7 +241,7 @@ suitable as the future TTS engine BEFORE wiring TTS into LiveKit.
     (short / normal / long buckets; exercises AngioPlus, AngioPlus Core,
     PStation, μFR, катетер, калибровка, ангиография, коронарная артерия,
     стеноз, виртуальный стент).
-  - `scripts/qwen_tts_poc.py` — human-run PoC:
+  - `scripts/tts/qwen_tts_poc.py` — human-run PoC:
     text -> Qwen3-TTS 0.6B -> Russian -> WAV, with latency/resource measurements.
   - `requirements-qwen-tts.txt` — ISOLATED dependency file. DO NOT install into
     the shared `.venv`: qwen-tts==0.1.1 pins transformers==4.57.3, conflicting
@@ -341,7 +341,7 @@ PROPOSED LATENCY TARGETS:
   total <= 2.0 s.
 - These are targets pending a real GPU benchmark; not verified numbers yet.
 
-NEXT (do NOT start D2.3): run `scripts/qwen_tts_poc.py` on a rented CUDA GPU
+NEXT (do NOT start D2.3): run `scripts/tts/qwen_tts_poc.py` on a rented CUDA GPU
 (eager/SDPA first, then flash-attn) to measure load time, synthesis RTF, actual
 VRAM, and confirm bf16. Then measure end-to-end FINAL_TRANSCRIPT -> first audio
 with a NON-STREAMING integration before considering a streaming path.
@@ -357,7 +357,7 @@ with a NON-STREAMING integration before considering a streaming path.
   GPU for reasonable speed. CPU-only execution is possible but expected to be
   slow; the manual test must be done in an isolated venv (see
   requirements-qwen-tts.txt). No Qwen model has been downloaded yet in D2.2;
-  the human must consciously run `scripts/qwen_tts_poc.py` (or a manual HF
+  the human must consciously run `scripts/tts/qwen_tts_poc.py` (or a manual HF
   download) in the isolated env after the PoC was prepared.
 
 ## Current Server Constraints

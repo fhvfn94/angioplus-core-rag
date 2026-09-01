@@ -2,7 +2,7 @@
 """Tests for the Phase D2.2 Qwen3-TTS PoC (Phase D2.2, TASK 7).
 
 These tests cover ONLY the deterministic pure logic in
-scripts/qwen_tts_poc.py and voice/tts_phrases.py. They NEVER import the real
+scripts/tts/qwen_tts_poc.py and voice/tts_phrases.py. They NEVER import the real
 Qwen model (qwen_tts is imported lazily and only inside `load_model`, which
 these tests do not call), never download weights and never generate audio.
 
@@ -15,7 +15,7 @@ import sys
 
 import pytest
 
-from scripts.qwen_tts_poc import (
+from scripts.tts.qwen_tts_poc import (
     DEFAULT_LANGUAGE,
     DEFAULT_MODEL_ID,
     DEFAULT_SPEAKER,
@@ -32,7 +32,7 @@ from voice.tts_phrases import (
     safe_stem,
     short_phrases,
 )
-from scripts.qwen_tts_poc import detect_environment
+from scripts.tts.qwen_tts_poc import detect_environment
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +164,7 @@ def test_supported_speakers_set():
 
 
 def test_unknown_speaker_rejected():
-    from scripts.qwen_tts_poc import _build_parser
+    from scripts.tts.qwen_tts_poc import _build_parser
 
     parser = _build_parser()
     # Simulate the guard in main(): an unknown speaker must raise SystemExit.
@@ -194,7 +194,7 @@ def test_qwen_tts_import_optional_failure_is_tested():
     # The pure module must remain importable WITHOUT qwen_tts installed.
     # load_model() is the only place that imports qwen_tts; it raises
     # SystemExit with a helpful message when the package is absent.
-    import scripts.qwen_tts_poc as poc
+    import scripts.tts.qwen_tts_poc as poc
 
     def _fake_import(*names):
         raise ImportError("No module named 'qwen_tts'")

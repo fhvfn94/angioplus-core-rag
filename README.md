@@ -65,7 +65,7 @@ back to the call participant (as text/data; TTS not yet implemented). This is
 development work only, not yet the production voice path.
 
 Phase D2.2 is evaluating Qwen3-TTS 0.6B (`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`)
-in an ISOLATED proof-of-concept (`scripts/qwen_tts_poc.py` + `voice/tts_phrases.py`,
+in an ISOLATED proof-of-concept (`scripts/tts/qwen_tts_poc.py` + `voice/tts_phrases.py`,
 isolated deps in `requirements-qwen-tts.txt`). TTS is NOT yet connected to
 LiveKit; the D2.2 work only decides whether Qwen3-TTS is suitable as a future
 TTS engine. See PROJECT_CONTEXT.md for environment/compatibility notes.

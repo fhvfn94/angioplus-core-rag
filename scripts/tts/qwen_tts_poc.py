@@ -33,13 +33,13 @@ transformers==4.57.6.
 
 Usage (human-run, in the isolated env):
     # single utterance -> output.wav
-    python scripts/qwen_tts_poc.py --text "Как выполнить калибровку катетера?" --output output.wav
+    python scripts/tts/qwen_tts_poc.py --text "Как выполнить калибровку катетера?" --output output.wav
 
     # run the whole AngioPlus TTS phrase set -> one WAV per phrase id
-    python scripts/qwen_tts_poc.py --dataset --out-dir data/tts_out
+    python scripts/tts/qwen_tts_poc.py --dataset --out-dir data/tts_out
 
     # choose a built-in speaker (default: Vivian) and pick the device
-    python scripts/qwen_tts_poc.py --text "Что показывает μFR?" --speaker Ryan --device cpu
+    python scripts/tts/qwen_tts_poc.py --text "Что показывает μFR?" --speaker Ryan --device cpu
 """
 from __future__ import annotations
 
@@ -52,10 +52,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
-# Make project modules importable when run as `python scripts/qwen_tts_poc.py`
+# Make project modules importable when run as `python scripts/tts/qwen_tts_poc.py`
 # from the repo root.
 sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
 from voice.tts_phrases import (  # noqa: E402

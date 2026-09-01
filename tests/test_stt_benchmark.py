@@ -2,11 +2,11 @@
 """Tests for the STT benchmark helper normalization + CER/WER (Phase D1.5).
 
 These tests cover only the deterministic pure functions in
-scripts/stt_benchmark.py (no model, no audio, no wall-clock timing).
+scripts/stt/stt_benchmark.py (no model, no audio, no wall-clock timing).
 """
 from __future__ import annotations
 
-from scripts.stt_benchmark import _cer, _wer, normalize
+from scripts.stt.stt_benchmark import _cer, _wer, normalize
 
 
 def test_normalize_conservative():

@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AngioPlus Voice Assistant</title>
+
+    <style>
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f4f6f8;
+            color: #1f2937;
+        }
+
+        .container {
+            max-width: 700px;
+            margin: 60px auto;
+            padding: 20px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 16px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+        }
+
+        h1 {
+            margin-top: 0;
+        }
+
+        #status {
+            margin: 20px 0;
+            font-size: 18px;
+            font-weight: bold;
+        }
+
+        button {
+            font-size: 18px;
+            padding: 14px 24px;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+
+        #startButton {
+            background: #2563eb;
+            color: white;
+        }
+
+        #stopButton {
+            background: #dc2626;
+            color: white;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: default;
+        }
+
+        .log {
+            margin-top: 25px;
+            padding-top: 20px;
+            border-top: 1px solid #e5e7eb;
+        }
+
+        .message {
+            margin-bottom: 12px;
+            line-height: 1.5;
+        }
+
+        .user {
+            color: #2563eb;
+        }
+
+        .assistant {
+            color: #059669;
+        }
+
+        .error {
+            color: #dc2626;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+    <div class="card">
+
+        <h1>AngioPlus Voice Assistant</h1>
+
+        <div id="status">
+            ● Отключено
+        </div>
+
+        <button id="startButton">
+            Начать разговор
+        </button>
+
+        <button id="stopButton" disabled>
+            Завершить
+        </button>
+
+        <div class="log" id="log"></div>
+
+    </div>
+</div>
+
+
+<script>
+    const startButton = document.getElementById("startButton");
+    const stopButton = document.getElementById("stopButton");
+    const statusElement = document.getElementById("status");
+    const logElement = document.getElementById("log");
+
+    let socket = null;
+    let audioContext = null;
+    let microphoneStream = null;
+    let sourceNode = null;
+    let processorNode = null;
+
+    let nextPlaybackTime = 0;
+
+
+    function setStatus(text) {
+        statusElement.textContent = text;
+    }
+
+
+    function addLog(text, className = "") {
+        const div = document.createElement("div");
+        div.className = "message " + className;
+        div.textContent = text;
+        logElement.appendChild(div);
+
+        window.scrollTo({
+            top: document.body.scrollHeight,
+            behavior: "smooth"
+        });
+    }
+
+
+    // ========================================================
+    // FLOAT32 -> PCM16
+    // ========================================================
+
+    function floatTo16BitPCM(float32Array) {
+        const buffer = new ArrayBuffer(float32Array.length * 2);
+        const view = new DataView(buffer);
+
+        for (let i = 0; i < float32Array.length; i++) {
+            let sample = Math.max(-1, Math.min(1, float32Array[i]));
+
+            sample = sample < 0
+                ? sample * 0x8000
+                : sample * 0x7FFF;
+
+            view.setInt16(
+                i * 2,
+                sample,
+                true
+            );
+        }
+
+        return buffer;
+    }
+
+
+    // ========================================================
+    // PCM16 -> FLOAT32
+    // ========================================================
+
+    function pcm16ToFloat32(arrayBuffer) {
+        const view = new DataView(arrayBuffer);
+        const length = arrayBuffer.byteLength / 2;
+
+        const float32 = new Float32Array(length);
+
+        for (let i = 0; i < length; i++) {
+            const sample = view.getInt16(i * 2, true);
+
+            float32[i] =
+                sample < 0
+                    ? sample / 32768
+                    : sample / 32767;
+        }
+
+        return float32;
+    }
+
+
+    // ========================================================
+    // PLAY AUDIO FROM YANDEX
+    // ========================================================
+
+    function playPCM(arrayBuffer) {
+        if (!audioContext) {
+            return;
+        }
+
+        const floatData = pcm16ToFloat32(arrayBuffer);
+
+        const audioBuffer =
+            audioContext.createBuffer(
+                1,
+                floatData.length,
+                44100
+            );
+
+        audioBuffer.copyToChannel(floatData, 0);
+
+        const source =
+            audioContext.createBufferSource();
+
+        source.buffer = audioBuffer;
+
+        source.connect(
+            audioContext.destination
+        );
+
+        const currentTime =
+            audioContext.currentTime;
+
+        if (
+            nextPlaybackTime <
+            currentTime
+        ) {
+            nextPlaybackTime =
+                currentTime;
+        }
+
+        source.start(
+            nextPlaybackTime
+        );
+
+        nextPlaybackTime +=
+            audioBuffer.duration;
+    }
+
+
+    // ========================================================
+    // START MICROPHONE
+    // ========================================================
+
+    async function startMicrophone() {
+
+        microphoneStream =
+            await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    channelCount: 1,
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true
+                }
+            });
+
+
+        audioContext =
+            new AudioContext({
+                sampleRate: 44100
+            });
+
+
+        sourceNode =
+            audioContext.createMediaStreamSource(
+                microphoneStream
+            );
+
+
+        processorNode =
+            audioContext.createScriptProcessor(
+                2048,
+                1,
+                1
+            );
+
+
+        processorNode.onaudioprocess =
+            (event) => {
+
+                if (
+                    !socket ||
+                    socket.readyState !== WebSocket.OPEN
+                ) {
+                    return;
+                }
+
+                const input =
+                    event.inputBuffer.getChannelData(0);
+
+                const pcmBuffer =
+                    floatTo16BitPCM(input);
+
+                socket.send(
+                    pcmBuffer
+                );
+            };
+
+
+        sourceNode.connect(
+            processorNode
+        );
+
+
+        processorNode.connect(
+            audioContext.destination
+        );
+
+
+        setStatus(
+            "🎙️ Подключено — говорите"
+        );
+    }
+
+
+    // ========================================================
+    // STOP EVERYTHING
+    // ========================================================
+
+    async function stopConversation() {
+
+        if (
+            socket &&
+            socket.readyState === WebSocket.OPEN
+        ) {
+            socket.send(
+                JSON.stringify({
+                    type: "disconnect"
+                })
+            );
+
+            socket.close();
+        }
+
+
+        if (processorNode) {
+            processorNode.disconnect();
+            processorNode = null;
+        }
+
+
+        if (sourceNode) {
+            sourceNode.disconnect();
+            sourceNode = null;
+        }
+
+
+        if (microphoneStream) {
+
+            microphoneStream
+                .getTracks()
+                .forEach(track =>
+                    track.stop()
+                );
+
+            microphoneStream = null;
+        }
+
+
+        if (audioContext) {
+
+            await audioContext.close();
+
+            audioContext = null;
+        }
+
+
+        nextPlaybackTime = 0;
+
+        setStatus(
+            "● Отключено"
+        );
+
+
+        startButton.disabled = false;
+        stopButton.disabled = true;
+    }
+
+
+    // ========================================================
+    // START CONVERSATION
+    // ========================================================
+
+    async function startConversation() {
+
+        startButton.disabled = true;
+
+        setStatus(
+            "Подключение..."
+        );
+
+
+        const protocol =
+            window.location.protocol === "https:"
+                ? "wss"
+                : "ws";
+
+
+        const wsUrl =
+            `${protocol}://${window.location.host}/ws`;
+
+
+        socket =
+            new WebSocket(wsUrl);
+
+
+        socket.binaryType =
+            "arraybuffer";
+
+
+        socket.onopen =
+            () => {
+
+                setStatus(
+                    "Соединение установлено..."
+                );
+
+                stopButton.disabled = false;
+            };
+
+
+        socket.onmessage =
+            async (event) => {
+
+                // -----------------------------
+                // AUDIO
+                // -----------------------------
+
+                if (
+                    event.data instanceof ArrayBuffer
+                ) {
+
+                    playPCM(
+                        event.data
+                    );
+
+                    return;
+                }
+
+
+                // -----------------------------
+                // JSON EVENTS
+                // -----------------------------
+
+                let message;
+
+                try {
+                    message =
+                        JSON.parse(
+                            event.data
+                        );
+                } catch {
+                    return;
+                }
+
+
+                const type =
+                    message.type;
+
+
+                if (
+                    type === "connecting"
+                ) {
+
+                    setStatus(
+                        "Подключение к AngioPlus..."
+                    );
+                }
+
+
+                else if (
+                    type === "connected"
+                ) {
+
+                    setStatus(
+                        "Подключено к Yandex..."
+                    );
+                }
+
+
+                else if (
+                    type === "ready"
+                ) {
+
+                    try {
+
+                        await startMicrophone();
+
+                    } catch (error) {
+
+                        console.error(error);
+
+                        addLog(
+                            "Не удалось получить доступ к микрофону.",
+                            "error"
+                        );
+
+                        await stopConversation();
+                    }
+                }
+
+
+                else if (
+                    type === "speech_started"
+                ) {
+
+                    setStatus(
+                        "🎤 Слушаю..."
+                    );
+                }
+
+
+                else if (
+                    type === "speech_stopped"
+                ) {
+
+                    setStatus(
+                        "🤖 Думаю..."
+                    );
+                }
+
+
+                else if (
+                    type === "user_transcript"
+                ) {
+
+                    addLog(
+                        "Вы: " +
+                        message.text,
+                        "user"
+                    );
+                }
+
+
+                else if (
+                    type === "assistant_transcript"
+                ) {
+
+                    addLog(
+                        "AngioPlus: " +
+                        message.text,
+                        "assistant"
+                    );
+
+                    setStatus(
+                        "🎙️ Подключено — говорите"
+                    );
+                }
+
+
+                else if (
+                    type === "error"
+                ) {
+
+                    addLog(
+                        message.message ||
+                        "Произошла ошибка.",
+                        "error"
+                    );
+                }
+            };
+
+
+        socket.onerror =
+            (error) => {
+
+                console.error(
+                    "WebSocket error",
+                    error
+                );
+
+                addLog(
+                    "Ошибка WebSocket.",
+                    "error"
+                );
+            };
+
+
+        socket.onclose =
+            () => {
+
+                if (
+                    microphoneStream ||
+                    audioContext
+                ) {
+
+                    stopConversation();
+                }
+
+                setStatus(
+                    "● Соединение закрыто"
+                );
+
+                startButton.disabled = false;
+                stopButton.disabled = true;
+            };
+    }
+
+
+    // ========================================================
+    // BUTTONS
+    // ========================================================
+
+    startButton.addEventListener(
+        "click",
+        startConversation
+    );
+
+
+    stopButton.addEventListener(
+        "click",
+        stopConversation
+    );
+
+</script>
+
+</body>
+</html>

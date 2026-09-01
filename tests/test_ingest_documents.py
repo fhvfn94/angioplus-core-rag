@@ -1,6 +1,5 @@
 import pytest
-
-from scripts.ingest_documents import build_embedding_text
+from scripts.retrieval.ingest_documents import build_embedding_text
 
 
 @pytest.mark.parametrize(

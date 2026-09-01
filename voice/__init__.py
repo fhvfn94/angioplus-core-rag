@@ -10,5 +10,5 @@ Phase D2.3 adds two remote-Qwen3-TTS boundaries:
   - ``voice/tts_publisher.py`` - publishes the returned PCM into the LiveKit
     room as a spoken track.
 Both keep heavy GPU deps (torch / qwen_tts / transformers) OUT of this package:
-they run only in the isolated scripts/tts_server.py on the remote GPU.
+they run only in the isolated scripts/tts/tts_server.py on the remote GPU.
 """

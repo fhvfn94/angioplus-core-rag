@@ -12,7 +12,7 @@ import textwrap
 
 from qdrant_client import QdrantClient
 
-# Keep defaults aligned with scripts/ingest_documents.py
+# Keep defaults aligned with scripts/retrieval/ingest_documents.py
 DEFAULT_COLLECTION = "angioplus_documents"
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 DEFAULT_GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-001"

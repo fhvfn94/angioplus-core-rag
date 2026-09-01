@@ -4,7 +4,7 @@
 The Qwen3-TTS 0.6B model does NOT run inside the local LiveKit voice worker
 (transformers pin conflict + it needs a CUDA GPU). Instead it runs on a
 remote GPU (e.g. a Vast.ai RTX 4090) behind a tiny FastAPI service
-(scripts/tts_server.py). This module is the ONLY boundary between the local
+(scripts/tts/tts_server.py). This module is the ONLY boundary between the local
 LiveKit worker and that GPU TTS service.
 
 Responsibilities:

@@ -16,7 +16,7 @@ message (destination = the speaking participant).
 
 Phase D2.3 adds the FIRST voice-to-voice link: after the RAG answer is sent as
 text/data, the same answer is synthesized by a REMOTE Qwen3-TTS HTTP service
-(voice.tts_client -> scripts/tts_server.py on a GPU) and the resulting audio is
+(voice.tts_client -> scripts/tts/tts_server.py on a GPU) and the resulting audio is
 published into the room as a spoken track (voice.tts_publisher). TTS is
 OPTIONAL and OFF by default: it is enabled only when TTS_BASE_URL is set, so the
 existing text/data-only path keeps working when no GPU TTS is reachable. SIP /

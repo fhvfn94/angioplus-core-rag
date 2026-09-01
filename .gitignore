@@ -36,3 +36,22 @@ litekit_agent_out*.log
 # Local Qwen TTS PoC
 .venv-qwen/
 output*.wav
+
+
+# Generated experiment artifacts
+artifacts/
+
+# Generated TTS audio
+data/tts_out/
+
+# Temporary Yandex KB test corpus
+data/yandex_v2_test/
+
+# Local external tools
+cloudflared.exe
+
+# Research papers kept locally, not part of production KB
+data/training_materials/1_2017_JACC_FAVOR II China.pdf
+data/training_materials/2_2021_Lancet_FAVOR III China.docx
+data/training_materials/3_2022_JACC_FAVOR III China 2 year outcome_Song Lei.pdf
+data/training_materials/4_2025_LANCET_FLAVOUR II_Jianan Wang.docx

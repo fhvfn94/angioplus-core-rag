@@ -45,11 +45,11 @@ import numpy as np
 
 from livekit import agents, rtc
 
-# Allow running directly as `python scripts/stt_benchmark.py` from anywhere:
-# put the repo root (parent of this script dir) on sys.path so `voice` and
+# Allow running directly as `python scripts/stt/stt_benchmark.py` from anywhere:
+# put the repo root (parent of scripts/) on sys.path so `voice` and
 # project modules are importable without installing the package.
 sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
 from voice.stt import FasterWhisperSTT  # noqa: E402

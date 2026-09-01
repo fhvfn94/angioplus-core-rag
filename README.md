@@ -1,348 +1,457 @@
 # AngioPlus Core AI Support Assistant
 
-RAG-based AI assistant for technical support of the AngioPlus Core medical software.
+ИИ-ассистент для технической поддержки медицинского программного обеспечения AngioPlus Core.
 
-The system answers questions strictly from indexed product documentation and is intended to support L1/L2 technical support workflows.
+Цель проекта — создать полноценного голосового ассистента, который сможет естественно общаться с пользователями на русском языке, отвечать на технические вопросы строго на основании утверждённой документации AngioPlus, учитывать контекст разговора и передавать обращение человеку, если имеющейся информации недостаточно.
 
-## Current Status
+Главные приоритеты проекта:
 
-The MVP is operational.
+**точность → подтверждённость документацией → безопасность → скорость ответа.**
 
-Implemented:
+---
 
-- Telegram bot
-- text questions
-- voice questions
-- PDF / DOCX / XLSX ingestion
-- local multilingual embeddings
-- Qdrant vector search
-- DeepSeek answer generation
-- query normalization
-- short conversation memory
-- follow-up question rewriting
-- source metadata
-- citation of chunks actually used by the LLM
-- secret filtering
-- fallback when documentation does not contain the answer
+## Цель проекта
 
-## Architecture
+Итоговая система должна поддерживать:
 
-### Ingestion
+- входящие звонки на обычный телефонный номер;
+- естественный голосовой диалог на русском языке в реальном времени;
+- возможность перебивать ассистента во время ответа (barge-in);
+- ответы, основанные на утверждённой документации AngioPlus;
+- сохранение контекста разговора;
+- понимание уточняющих вопросов;
+- возможность определить источник информации;
+- отказ от ответа, если документация не содержит достаточной информации;
+- передачу обращения человеку;
+- создание тикетов и интеграцию с системами технической поддержки;
+- подключение дополнительных инструментов и диагностических систем;
+- журналирование и аналитику;
+- управление версиями базы знаний.
 
-documents
-→ parsing
-→ structured chunking
-→ metadata
-→ BAAI/bge-m3 embeddings
-→ Qdrant
+Ассистент предназначен прежде всего для **технической поддержки AngioPlus Core**.
 
-### Runtime
+Он не должен самостоятельно принимать клинические решения или придумывать медицинские рекомендации.
 
-Telegram message
-→ query normalization
-→ optional conversation-context rewrite
-→ BAAI/bge-m3 query embedding
-→ Qdrant retrieval
-→ direct-answer gate
-→ DeepSeek generation
-→ source citation extraction
-→ secret/output safety filter
-→ Telegram response
+---
 
-### Voice
+## Текущее направление разработки
 
-Telegram voice
-→ Gemini audio transcription
-→ text query
-→ normal RAG pipeline
+Проект переводится на архитектуру, максимально использующую сервисы Yandex AI Studio.
 
-Voice transcription may later be migrated to a local Whisper/faster-whisper implementation.
+Целевая архитектура:
 
-Development work on the `feature/livekit-voice-agent` branch replaces Gemini with
-a local pipeline (Silero VAD + faster-whisper) and, since phase D2.1, sends each
-transcribed utterance to the same RAG `/ask` endpoint and publishes the answer
-back to the call participant (as text/data; TTS not yet implemented). This is
-development work only, not yet the production voice path.
+```text
+Телефон / браузер
+        ↓
+Yandex Realtime
+        ↕
+custom function call
+        ↓
+Тонкий Python RAG Controller
+        ↓
+Yandex Vector Store Search
+        ↓
+База знаний AngioPlus
+```
 
-Phase D2.2 is evaluating Qwen3-TTS 0.6B (`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`)
-in an ISOLATED proof-of-concept (`scripts/tts/qwen_tts_poc.py` + `voice/tts_phrases.py`,
-isolated deps in `requirements-qwen-tts.txt`). TTS is NOT yet connected to
-LiveKit; the D2.2 work only decides whether Qwen3-TTS is suitable as a future
-TTS engine. See PROJECT_CONTEXT.md for environment/compatibility notes.
+Python остаётся только там, где собственная логика действительно необходима.
 
-## Technology Stack
+Основные задачи Python-контроллера:
 
-- Python 3.12
-- FastAPI
-- aiogram
-- Docker Compose
-- Qdrant
-- sentence-transformers
-- BAAI/bge-m3
-- DeepSeek API
-- OpenAI-compatible Python SDK for DeepSeek API access
-- Google Gemini API for voice transcription
+- подготовка поискового запроса;
+- при необходимости переписывание запроса для retrieval;
+- обращение к Yandex Vector Store Search;
+- фильтрация результатов;
+- применение приоритетов источников;
+- reranking при необходимости;
+- выбор небольшого количества релевантных фрагментов;
+- передача компактного evidence в Realtime;
+- журналирование поисковых запросов, результатов и источников;
+- применение бизнес-правил и safety-ограничений;
+- будущие интеграции и инструменты;
+- эскалация обращения;
+- интеграция с телефонией.
 
-Important:
+На текущем этапе проект не планирует сохранять собственную Vector DB и локальную embedding-инфраструктуру, если тестирование не покажет, что возможностей Yandex Vector Store недостаточно.
 
-The OpenAI Python package is currently used only as an OpenAI-compatible client for DeepSeek.
+---
 
-Requests are sent to:
+## Текущий Yandex-прототип
 
-https://api.deepseek.com
+Уже существует рабочий прототип Yandex Realtime для:
 
-The project does NOT currently use OpenAI models or the OpenAI API.
+- локального тестирования через микрофон;
+- удалённого тестирования через браузер.
 
-## Embeddings
+Текущая структура:
 
-Provider:
+```text
+yandex/
+├── realtime/
+│   ├── mic_client.py
+│   └── web/
+│       ├── server.py
+│       └── static/
+│           └── index.html
+└── retrieval/
+    └── ingest.py
+```
 
-sentence_transformers
+Прототип уже поддерживает:
 
-Model:
+- передачу аудио с микрофона и из браузера;
+- голосовое взаимодействие через Yandex Realtime;
+- server-side VAD;
+- голосовые ответы на русском языке;
+- системные инструкции для AngioPlus;
+- подключение к Yandex AI Studio Vector Store;
+- удалённое браузерное тестирование через временный Cloudflare tunnel.
 
+В качестве предпочтительной границы между голосовым диалогом и контролируемым RAG выбран механизм **Yandex Realtime custom Function Calling**.
+
+---
+
+## Направление развития Retrieval
+
+Встроенный Realtime File Search был протестирован и работает, однако по результатам экспериментов он не рассматривается как предпочтительный production-вариант retrieval.
+
+Основные обнаруженные ограничения:
+
+- приложение не получает полный контроль над найденными фрагментами;
+- ограничен контроль над формированием поискового запроса;
+- сложно реализовать собственные правила приоритета источников;
+- найденные фрагменты добавляются в активный контекст Realtime;
+- повторные поиски значительно увеличивают размер контекста;
+- сложнее реализовать прозрачный аудит использованных источников.
+
+Во время реального тестирования повторное использование File Search привело к превышению лимита контекста Realtime.
+
+Поэтому предпочтительная архитектура:
+
+```text
+Yandex Realtime
+       ↓
+search_angioplus_knowledge(...)
+       ↓
+Python RAG Controller
+       ↓
+Yandex Vector Store Search API
+       ↓
+компактные найденные фрагменты
+       ↓
+Yandex Realtime
+```
+
+Standalone Yandex Vector Store Search уже протестирован.
+
+Он позволяет получать:
+
+- найденные chunks;
+- relevance score;
+- информацию об исходном файле;
+- metadata;
+- использовать фильтрацию.
+
+Это позволяет контролировать retrieval до передачи информации голосовой модели.
+
+---
+
+## Обработка поисковых запросов
+
+Эксперименты показали, что качество формирования запроса существенно влияет на Vector Store retrieval.
+
+Например, естественный голосовой вопрос пользователя в некоторых случаях плохо находил нужный фрагмент документации.
+
+При этом более компактный технический запрос с канонической терминологией AngioPlus мог выводить правильный chunk на первое место.
+
+Отдельный эксперимент с **YandexGPT Lite Query Rewriter** значительно улучшил retrieval для ряда сложных вопросов.
+
+Следующий планируемый retrieval-пайплайн:
+
+```text
+оригинальный / компактный запрос
+              +
+семантически переписанный запрос
+              ↓
+Yandex Vector Store Search
+              ↓
+merge / deduplicate
+              ↓
+YandexGPT Lite reranker
+              ↓
+1–3 компактных evidence chunks
+              ↓
+Yandex Realtime
+```
+
+Эта архитектура пока не считается окончательной.
+
+Она должна быть проверена на regression-наборе вопросов перед использованием в production.
+
+---
+
+## База знаний
+
+Основной набор документов AngioPlus включает:
+
+- `AngioPlus Core v2.5 IFU_RU_Final.pdf`
+- `2025July.pdf`
+- `Common Info to Distributor - commercial (1).pdf`
+- `Competitor_2025.pdf`
+- `Development_Questions_L1_L2.docx`
+- `Q&A List ENG.xlsx`
+
+Для нового Yandex V2 Vector Store используется более чистый тестовый набор.
+
+Из него исключён:
+
+`Development_Questions_L1_L2.docx`
+
+Причина: документ преимущественно содержит вопросы для разработки, а не авторитетные ответы, поэтому может создавать retrieval noise.
+
+Научные статьи в настоящий момент рассматриваются как исследовательские/reference-материалы и не входят в основную production-базу знаний.
+
+---
+
+## Приоритет источников
+
+При наличии информации в нескольких документах используется следующий общий порядок авторитетности:
+
+1. актуальная официальная IFU / регуляторная документация;
+2. официальная сервисная и административная документация;
+3. Release Notes / Known Issues;
+4. материалы технической поддержки L1/L2;
+5. FAQ / Training;
+6. коммерческие материалы;
+7. научные/reference-материалы, когда их использование действительно необходимо.
+
+Документ более высокого уровня должен иметь приоритет при конфликте информации.
+
+При этом приоритет источника не должен полностью заменять semantic relevance.
+
+Например, нерелевантный IFU chunk не должен автоматически становиться выше релевантного технического материала только потому, что он относится к IFU.
+
+---
+
+## Безопасность и Grounding
+
+Ассистент должен:
+
+- отвечать на технические вопросы AngioPlus на основании утверждённой документации;
+- не придумывать отсутствующие процедуры или факты о продукте;
+- отличать обязательные требования от рекомендаций;
+- отличать формулировку «не оценивалось» от «запрещено»;
+- не раскрывать пароли, API keys, tokens и другие credentials;
+- не принимать самостоятельные клинические решения;
+- запрашивать уточнение при неоднозначном распознавании речи или намерения пользователя;
+- отказываться от ответа или эскалировать обращение, если надёжной информации недостаточно.
+
+Сам факт нахождения некоторой информации через retrieval не означает, что ассистент автоматически имеет право выдавать её пользователю как рекомендацию.
+
+Safety-правила и ограничения имеют приоритет над ranking результатов поиска.
+
+---
+
+## Структура репозитория
+
+Репозиторий содержит как новую целевую архитектуру, так и предыдущую рабочую реализацию, которая временно сохраняется для сравнения, тестирования и исторической справки.
+
+```text
+yandex/
+    Текущая Yandex-first разработка.
+
+app/
+    Предыдущая RAG-реализация на Qdrant/BGE-M3.
+    Сохраняется как контрольная/reference-система.
+
+bot/
+    Telegram-интерфейс предыдущего RAG.
+    Сохраняется как контрольный путь.
+
+voice/
+    Предыдущая голосовая архитектура:
+    LiveKit + Silero + faster-whisper + Qwen3-TTS.
+    Legacy/reference.
+
+benchmarks/
+    Скрипты для оценки retrieval и архитектурных экспериментов.
+
+scripts/
+    Служебные, тестовые и экспериментальные скрипты,
+    разделённые по назначению.
+
+legacy/
+    Исторические вспомогательные компоненты,
+    которые больше не относятся к целевой архитектуре.
+
+data/
+    Исходные документы и локальные данные проекта.
+
+tests/
+    Автоматические тесты существующих компонентов.
+
+artifacts/
+    Сгенерированные диагностические/debug-результаты.
+    Не отслеживаются Git.
+```
+
+Наличие компонента в репозитории не означает, что он является частью целевой production-архитектуры.
+
+---
+
+## Контрольный RAG
+
+Предыдущая RAG-система временно сохраняется как контрольная/reference-реализация.
+
+Архитектура:
+
+```text
+Telegram
+   ↓
+FastAPI /ask
+   ↓
+query normalization / follow-up rewriting
+   ↓
 BAAI/bge-m3
-
-Dimension:
-
-1024
-
-Distance:
-
-COSINE
-
-Device:
-
-CPU
-
-Qdrant collection:
-
-angioplus_documents_bge_m3
-
-Current indexed dataset:
-
-6 documents
-118 chunks
-
-## LLM
-
-Provider:
-
+   ↓
+Qdrant
+   ↓
 DeepSeek
+   ↓
+Telegram
+```
 
-Current model:
+Основные компоненты:
 
-deepseek-v4-flash
+- `app/`
+- `bot/`
+- `Dockerfile.rag`
+- `Dockerfile.bot`
+- `docker-compose.yml`
+- `requirements-rag.txt`
+- `requirements-ml.txt`
+- `requirements-constraints.txt`
+- `requirements-bot.txt`
 
-The LLM receives only retrieved and sanitized document context.
+Новые архитектурные возможности не должны добавляться в этот стек без необходимости.
 
-If the available context does not answer the question, the assistant must respond:
+Он сохраняется для:
 
-"Такой информации нет в имеющейся документации."
+- контрольного сравнения;
+- regression testing;
+- проверки поведения новой системы;
+- временной поддержки существующего рабочего MVP.
 
-## Retrieval
+---
 
-Current retrieval depth:
+## Legacy Voice Stack
 
-top_k = 10
+В репозитории также сохраняется предыдущая голосовая архитектура:
 
-This value was increased from 5 after regression testing showed that a correct IFU chunk could appear at position 6.
+- LiveKit;
+- Silero VAD;
+- faster-whisper;
+- Qwen3-TTS.
 
-Example:
+Связанные компоненты:
 
-Question:
-"Где посмотреть версию программного обеспечения?"
+- `voice/`
+- `scripts/voice/`
+- `scripts/stt/`
+- `scripts/tts/`
+- `requirements-livekit.txt`
+- `requirements-qwen-tts.txt`
+- `requirements-tts-server.txt`
 
-Relevant IFU chunk:
-position 6
+Этот код сохраняется для:
 
-With top_k=5 the answer was missed.
-With top_k=10 the correct answer is retrieved.
+- истории разработки;
+- benchmark-тестов;
+- возможного повторного использования отдельных решений.
 
-Do not reduce top_k without regression testing.
+Он **не является текущей целевой голосовой архитектурой**.
 
-## Source Priority
+---
 
-Source authority:
+## Принципы разработки
 
-1. IFU / official regulatory documentation
-2. Official service and administrator documentation
-3. Release notes / known issues
-4. L1/L2 internal support materials
-5. FAQ / training materials
-6. Commercial materials
+Перед архитектурными изменениями необходимо:
 
-If IFU conflicts with another source, IFU wins.
+1. Проверить фактическое состояние исходного кода.
+2. Прочитать `PROJECT_CONTEXT.md`.
+3. Выполнить `git status`.
+4. Делать небольшие и обратимые изменения.
+5. Запускать соответствующие тесты.
+6. Проверять retrieval-изменения на regression-наборе вопросов.
+7. Не заменять работающий компонент только потому, что другая технология теоретически выглядит лучше.
+8. Никогда не публиковать и не коммитить секреты.
 
-FAQ and training materials may supplement IFU but must not override it.
+Диагностические и экспериментальные результаты не должны засорять корень репозитория.
 
-## Source Citations
+---
 
-The LLM receives numbered retrieved chunks:
+## Git Workflow
 
-[Chunk 1]
-[Chunk 2]
-...
+Обычный процесс разработки:
 
-For successful answers it returns an internal marker:
+```text
+локальная разработка
+→ tests / benchmarks
+→ проверка git diff
+→ commit
+→ push
+→ pull на сервере
+→ rebuild / restart изменённых сервисов
+→ smoke test
+```
 
-[[USED_CHUNKS: 2, 6]]
+Production-сервер не должен становиться основной средой разработки.
 
-The application removes this marker before sending the response to the user.
+Секреты должны храниться в локальных `.env` и никогда не попадать в Git.
 
-Only metadata from the cited chunks is shown in the Telegram "Источники" section.
+---
 
-This prevents unrelated top-ranked Qdrant results from being presented as answer sources.
+## Текущая точка разработки
 
-## Conversation Context
+Сейчас завершается очистка репозитория и разделение компонентов на:
 
-Conversation context is enabled.
-
-Current configuration:
-
-CONVERSATION_TTL_SECONDS=1800
-CONVERSATION_MAX_TURNS=3
-
-The system can rewrite follow-up questions into standalone retrieval questions.
-
-Example:
-
-User:
-"Кто может устанавливать AngioPlus Core?"
-
-Follow-up:
-"А кто может его обслуживать?"
-
-The second question may use recent conversation context to resolve the reference.
-
-## Query Normalization
-
-Query normalization is enabled before embedding and retrieval.
-
-The original user question and the normalized/standalone versions are tracked separately in logs.
-
-## Safety
-
-The assistant must:
-
-- answer only from retrieved documentation
-- never invent missing procedures
-- never expose passwords, API keys, tokens or credentials
-- distinguish mandatory IFU requirements from recommendations
-- distinguish "not evaluated" from "prohibited"
-- return a documentation-not-found response when direct support is absent
-
-Secrets are sanitized before context is sent to external LLM providers.
-
-Generated output also passes through a secret filter.
-
-## Documents
-
-Current knowledge base includes:
-
-- AngioPlus Core v2.5 IFU_RU_Final.pdf
-- 2025July.pdf
-- Common Info to Distributor - commercial (1).pdf
-- Competitor_2025.pdf
-- Development_Questions_L1_L2.docx
-- Q&A List ENG.xlsx
-
-## Qdrant
-
-Current collection:
-
-angioplus_documents_bge_m3
-
-Current state after ingestion:
-
-points = 118
-status = green
-vector size = 1024
-distance = COSINE
-
-## Main Environment Configuration
-
-Secrets must never be committed.
-
-Important configuration:
-
-EMBEDDING_PROVIDER=sentence_transformers
-LOCAL_EMBEDDING_MODEL=BAAI/bge-m3
-EMBEDDING_DEVICE=cpu
-EMBEDDING_BATCH_SIZE=4
-
-QDRANT_COLLECTION=angioplus_documents_bge_m3
-
-LLM_PROVIDER=deepseek
-DEEPSEEK_MODEL=deepseek-v4-flash
-
-QUERY_NORMALIZATION_ENABLED=true
-QUERY_CONTEXT_ENABLED=true
-
-CONVERSATION_TTL_SECONDS=1800
-CONVERSATION_MAX_TURNS=3
-
-QUERY_LOW_SCORE_LOG_THRESHOLD=0.45
-
-## Development Workflow
-
-Development should normally be performed locally.
-
-Recommended flow:
-
-local VS Code
-→ implementation
-→ tests
-→ git commit
-→ git push origin main
-→ server git pull --ff-only origin main
-→ rebuild/restart affected Docker services
-→ production smoke test
-
-Avoid editing production server code directly except for emergency diagnostics.
-
-## Current Known Issues / Improvements
-
-### Response latency
-
-Typical request:
-
-- local embedding: ~0.5–1.0 s
-- Qdrant: ~0.1 s
-- DeepSeek gate: ~1–2 s
-- DeepSeek generation: ~3–8 s
-
-Large answers may take significantly longer.
-
-The direct-answer gate currently causes a second DeepSeek request.
-
-A future optimization may merge gate + generation into one LLM request after regression testing proves grounding remains safe.
-
-### Voice transcription
-
-Voice currently depends on Gemini.
-
-Possible future migration:
-
-faster-whisper / whisper.cpp
-
-This would remove an external dependency and allow local speech recognition.
-
-### Retrieval
-
-Dense BGE-M3 retrieval works, but further testing may justify:
-
-- hybrid dense + lexical search
-- reranking
-- query expansion
-- metadata-aware retrieval
-
-Do not implement these without measuring retrieval failures first.
-
-## Development Principle
-
-Accuracy > creativity.
-
-Do not change architecture because an alternative sounds theoretically better.
-
-Every retrieval, safety or prompt change must be validated against regression questions.
+- текущие;
+- контрольные;
+- legacy.
+
+После завершения cleanup следующий этап — продолжение контролируемых экспериментов с Yandex retrieval:
+
+```text
+оригинальный / компактный запрос
+              +
+YandexGPT Lite semantic rewrite
+              ↓
+Yandex Vector Store Search
+              ↓
+merge / deduplicate
+              ↓
+YandexGPT Lite reranking
+              ↓
+компактный подтверждённый evidence
+              ↓
+Yandex Realtime custom function
+```
+
+Цель следующего этапа — не усложнить архитектуру.
+
+Необходимо определить **минимально достаточный retrieval-пайплайн**, который обеспечивает:
+
+- высокий recall;
+- правильный приоритет источников;
+- прозрачность используемых источников;
+- низкую задержку;
+- контролируемое использование контекста Realtime;
+- безопасные и подтверждённые документацией ответы.
+
+---
+
+## Главный принцип проекта
+
+> **Система должна быть настолько простой, насколько это возможно, но настолько контролируемой, насколько это необходимо для надёжной технической поддержки медицинского программного обеспечения.**
+
+Если возникает выбор между красивой архитектурой и измеримо более надёжным решением, приоритет имеет надёжность.

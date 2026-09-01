@@ -1,57 +1,358 @@
-# PROJECT CONTEXT — AngioPlus Core RAG
+# PROJECT CONTEXT — AngioPlus Core AI Support Assistant
 
-Last updated: 2026-08 (D2.2b)
+Последнее крупное обновление контекста: 2026-09
 
-## Purpose
+Этот файл является технической памятью проекта для AI coding agents и разработчиков.
 
-This file is the compact current-state memory for AI coding agents.
+Он должен отвечать на вопросы:
 
-Before making architectural changes:
+- что именно мы строим;
+- какая архитектура является целевой;
+- что уже реально протестировано;
+- какие решения были приняты и почему;
+- какие компоненты являются current / control / legacy;
+- какие эксперименты уже проводились;
+- какие проблемы уже обнаружены;
+- что нельзя менять без доказательств;
+- с какой точки продолжать разработку.
 
-1. Read this file.
-2. Read README.md.
-3. Inspect current source code.
-4. Run `git status`.
-5. Do not assume older architecture still exists.
+README.md описывает проект на высоком уровне.
 
-## Current State
+Этот файл содержит более подробное техническое состояние и принятые архитектурные решения.
 
-The AngioPlus Core RAG MVP is running in production on a Docker server.
+---
 
-Main services:
+# 1. ОБЯЗАТЕЛЬНО ПРОЧИТАТЬ ПЕРЕД ИЗМЕНЕНИЯМИ
 
-- bot
-- rag
-- qdrant
+Перед любыми архитектурными изменениями:
 
-Telegram bot is operational.
+1. Прочитать этот файл.
+2. Прочитать `README.md`.
+3. Проверить фактическое состояние исходного кода.
+4. Выполнить:
 
-## Current Production Architecture
+```bash
+git status
+```
 
-Text request:
+5. Проверить текущую ветку.
+6. Не предполагать, что старая архитектура всё ещё является целевой только потому, что её код находится в репозитории.
+7. Делать небольшие и обратимые изменения.
+8. После каждого логического изменения запускать соответствующие тесты или benchmarks.
+9. Не удалять старые рабочие компоненты, пока новая архитектура не доказала свою работоспособность.
+10. Никогда не публиковать secrets.
 
+Если документация и фактический код расходятся, необходимо сначала проверить код и историю изменений, а не слепо доверять документации.
+
+---
+
+# 2. ЧТО МЫ СТРОИМ
+
+Цель проекта — production voice AI assistant для технической поддержки медицинского программного обеспечения AngioPlus Core.
+
+Пользователь должен иметь возможность позвонить на обычный телефонный номер и естественно разговаривать с ассистентом на русском языке.
+
+Итоговая система должна поддерживать:
+
+- обычную телефонию;
+- естественный realtime voice dialogue;
+- barge-in / interruption;
+- распознавание технической терминологии AngioPlus;
+- ответы только на основании утверждённой документации;
+- follow-up вопросы;
+- контекст разговора;
+- source traceability;
+- контролируемый retrieval;
+- отказ при отсутствии надёжного ответа;
+- human escalation;
+- будущую систему тикетов;
+- будущие diagnostic/business tools;
+- журналирование;
+- аналитику;
+- управление версиями базы знаний.
+
+Ассистент предназначен для технической поддержки.
+
+Он не должен самостоятельно принимать клинические решения.
+
+---
+
+# 3. ГЛАВНЫЙ ПРИНЦИП
+
+Приоритеты проекта:
+
+```text
+Grounded correctness
+        ↓
+Safety
+        ↓
+Retrieval reliability
+        ↓
+Traceability
+        ↓
+Latency
+        ↓
+Architectural simplicity
+```
+
+Красивое или технологически интересное решение не является причиной менять архитектуру.
+
+Изменение должно решать измеримую проблему.
+
+---
+
+# 4. ТЕКУЩЕЕ СТРАТЕГИЧЕСКОЕ РЕШЕНИЕ
+
+Проект движется в сторону максимально Yandex-first архитектуры.
+
+Пользователь проекта готов передать Yandex всё, что Yandex может надёжно выполнять сам, если это:
+
+- уменьшает количество собственной инфраструктуры;
+- снижает сложность;
+- сохраняет контроль над retrieval;
+- не ухудшает grounding;
+- не создаёт неприемлемые ограничения.
+
+Целевая архитектура:
+
+```text
+Phone / Browser
+       ↓
+Yandex Realtime
+       ↕
+custom function call
+       ↓
+Thin Python RAG Controller
+       ↓
+Yandex Vector Store Search
+       ↓
+AngioPlus Knowledge Base
+```
+
+Python должен оставаться только там, где собственная логика действительно необходима.
+
+---
+
+# 5. РОЛЬ PYTHON RAG CONTROLLER
+
+Будущий Python controller не должен превращаться в новый большой framework.
+
+Его предполагаемые обязанности:
+
+- получить запрос от Realtime tool call;
+- сохранить оригинальный пользовательский запрос;
+- при необходимости нормализовать техническую терминологию;
+- при необходимости создать semantic rewritten query;
+- вызвать Yandex Vector Store Search;
+- объединить результаты нескольких поисковых запросов;
+- удалить дубликаты;
+- применить source authority;
+- применить safety/business rules;
+- при необходимости выполнить reranking;
+- выбрать 1–3 компактных evidence chunks;
+- вернуть evidence в Yandex Realtime;
+- логировать:
+  - original query;
+  - rewritten query;
+  - retrieved chunks;
+  - scores;
+  - reranking;
+  - выбранные источники;
+  - финальный evidence.
+
+Позже controller также может отвечать за:
+
+- ticket creation;
+- CRM/helpdesk integration;
+- license lookup;
+- remote diagnostics;
+- escalation;
+- SIP/media bridge;
+- session management;
+- long-call context management;
+- дополнительные tools.
+
+---
+
+# 6. ЧЕГО МЫ НЕ ХОТИМ ДЕЛАТЬ БЕЗ НЕОБХОДИМОСТИ
+
+Не добавлять:
+
+- LangChain;
+- LlamaIndex;
+- LangGraph;
+- собственную сложную agent framework;
+- дополнительную Vector DB;
+- дополнительные embedding models;
+- собственный reranker;
+- сложную retrieval orchestration;
+
+только потому, что это стандартный RAG stack.
+
+Сначала использовать наиболее простой вариант.
+
+LangGraph может стать полезен позже, если появятся:
+
+- несколько tools;
+- сложные business workflows;
+- CRM;
+- tickets;
+- diagnostics;
+- branching;
+- human escalation.
+
+На текущем этапе он не нужен.
+
+---
+
+# 7. ТЕКУЩАЯ КЛАССИФИКАЦИЯ РЕПОЗИТОРИЯ
+
+В репозитории одновременно находятся новая архитектура, предыдущий рабочий RAG и старые voice-эксперименты.
+
+Это сделано сознательно.
+
+## CURRENT
+
+```text
+yandex/
+```
+
+Текущая Yandex-first разработка.
+
+Основные компоненты:
+
+```text
+yandex/
+├── realtime/
+│   ├── mic_client.py
+│   └── web/
+│       ├── server.py
+│       └── static/
+│           └── index.html
+└── retrieval/
+    └── ingest.py
+```
+
+---
+
+## CONTROL
+
+```text
+app/
+bot/
+Dockerfile.rag
+Dockerfile.bot
+docker-compose.yml
+requirements-rag.txt
+requirements-ml.txt
+requirements-constraints.txt
+requirements-bot.txt
+```
+
+Это предыдущая рабочая RAG-система.
+
+Она временно сохраняется как:
+
+- контрольная реализация;
+- regression reference;
+- benchmark;
+- резервный рабочий MVP.
+
+Новые архитектурные функции туда без необходимости не добавлять.
+
+---
+
+## LEGACY
+
+```text
+voice/
+scripts/voice/
+scripts/stt/
+scripts/tts/
+legacy/voice_helpers/
+
+requirements-livekit.txt
+requirements-qwen-tts.txt
+requirements-tts-server.txt
+```
+
+Это предыдущая voice-архитектура:
+
+```text
+LiveKit
++
+Silero VAD
++
+faster-whisper
++
+old RAG
++
+Qwen3-TTS
+```
+
+Она больше не является целевой архитектурой.
+
+Код пока сохраняется:
+
+- для истории;
+- benchmarks;
+- возможного повторного использования отдельных решений.
+
+Не продолжать разработку этого voice stack без отдельного решения.
+
+---
+
+# 8. СТАРЫЙ CONTROL RAG
+
+Предыдущая архитектура:
+
+```text
 Telegram
-→ bot
-→ FastAPI /ask
-→ query normalization
-→ optional conversation rewrite
-→ local BAAI/bge-m3 embedding
-→ Qdrant search
-→ DeepSeek direct-answer gate
-→ DeepSeek answer generation
-→ USED_CHUNKS parsing
-→ source filtering
-→ output safety filter
-→ Telegram
+   ↓
+bot
+   ↓
+FastAPI /ask
+   ↓
+query normalization
+   ↓
+follow-up rewriting
+   ↓
+BAAI/bge-m3
+   ↓
+Qdrant
+   ↓
+DeepSeek direct-answer gate
+   ↓
+DeepSeek answer generation
+   ↓
+USED_CHUNKS parsing
+   ↓
+source filtering
+   ↓
+output safety
+   ↓
+Telegram
+```
 
-Voice:
+Telegram voice:
 
-Telegram voice
-→ Gemini transcription
-→ same text RAG pipeline
+```text
+Telegram OGG
+   ↓
+Gemini STT
+   ↓
+same /ask RAG pipeline
+```
 
-## Embeddings
+Эта система реально работала и остаётся полезной как контроль.
 
+---
+
+# 9. CONTROL EMBEDDINGS / QDRANT
+
+Старая система использует:
+
+```text
 Provider:
 sentence_transformers
 
@@ -59,443 +360,2067 @@ Model:
 BAAI/bge-m3
 
 Device:
-cpu
+CPU
 
-Dimension:
+Vector dimension:
 1024
 
-Normalize embeddings:
+Normalization:
 true
-
-Collection:
-angioplus_documents_bge_m3
 
 Distance:
 COSINE
+```
 
-Current points:
-118
+Qdrant collection:
 
-## Retrieval
+```text
+angioplus_documents_bge_m3
+```
 
-Current top_k:
+Исходный production/control corpus:
 
+```text
+6 documents
+118 chunks
+```
+
+Исторический `top_k`:
+
+```text
 10
+```
 
-Do NOT revert to 5.
+Причина:
 
-Reason:
+для вопроса:
 
-Regression test:
+```text
+Где посмотреть версию программного обеспечения?
+```
 
-"Где посмотреть версию программного обеспечения?"
+нужный IFU chunk в старом retrieval однажды находился на позиции 6.
 
-Relevant IFU chunk ranked #6.
+Поэтому `top_k=5` давал regression failure, а `top_k=10` — правильный результат.
 
-top_k=5 failed.
-top_k=10 succeeded.
+Не переносить этот вывод автоматически на Yandex Vector Store.
 
-## Source Citation System
+---
 
-Retrieved context is numbered by chunk.
+# 10. CONTROL LLM
 
-LLM is instructed to append:
+Старый RAG использует DeepSeek.
 
-[[USED_CHUNKS: x, y]]
-
-`app/main.py` parses the marker.
-
-The marker is removed before user output.
-
-`build_sources()` receives only cited chunks when citations are available.
-
-This was implemented because previous source display simply showed the first three Qdrant results, which could be unrelated to the generated answer.
-
-## Source Priority
-
-Authority:
-
-IFU
-> official technical docs
-> L1/L2
-> FAQ/training
-> commercial
-
-IFU overrides lower-priority sources.
-
-Do not automatically boost all IFU chunks independent of semantic relevance.
-
-## LLM
-
+```text
 Provider:
 DeepSeek
 
 Model:
 deepseek-v4-flash
-
-API:
-https://api.deepseek.com
+```
 
 Python package:
+
+```text
 openai
+```
 
-Important:
+Важно:
 
-The project is NOT using OpenAI's API.
+`openai` здесь является только OpenAI-compatible SDK.
 
-The `openai` Python SDK is used because DeepSeek exposes an OpenAI-compatible API.
+Старая система не использует OpenAI API для генерации ответа.
 
-## Gate
+Успешный запрос обычно требует двух LLM calls:
 
-The system currently performs two external LLM calls for successful questions:
+1. direct-answer gate;
+2. answer generation.
 
-1. direct-answer gate
-2. answer generation
+Это улучшало grounding, но увеличивало latency.
 
-This improves grounding but increases latency.
+Не переносить эту двухступенчатую схему автоматически в новую архитектуру.
 
-Do not remove the gate without regression tests.
+---
 
-Possible future optimization:
-single-call answer/refusal generation.
+# 11. ПОЛЕЗНАЯ ЛОГИКА ИЗ СТАРОГО RAG
 
-## Query Context
+При переходе на новый controller не удалить случайно полезную доменную логику из:
 
-Enabled:
+```text
+app/domain_terms.py
+app/query_normalization.py
+app/followup.py
+app/prompts/system_prompt.md
+```
 
-QUERY_CONTEXT_ENABLED=true
+Эти файлы относятся к CONTROL stack, но содержат идеи, которые могут быть перенесены в новый controller после проверки.
 
-TTL:
-1800 seconds
+Не копировать их механически.
 
-Max turns:
-3
+Сначала определить, какая логика действительно нужна Yandex-first архитектуре.
 
-Query normalization:
-enabled
+---
 
-Follow-up rewriting exists.
+# 12. YANDEX REALTIME — РАБОЧИЙ ПРОТОТИП
 
-Needs additional regression testing.
+Рабочий локальный prototype использует Yandex AI Studio Realtime.
 
-## Voice
+Проверенная модель:
 
-### PRODUCTION (current live path)
+```text
+speech-realtime-250923
+```
 
-Transcription:
+WebSocket:
 
-Telegram voice -> Gemini transcription -> existing text RAG pipeline
+```text
+wss://ai.api.cloud.yandex.net/v1/realtime
+```
 
-Configured with:
+Рабочие audio settings:
 
-GEMINI_AUDIO_MODEL=gemini-3.5-flash
+```text
+samplerate = 44100
+blocksize = 882
+```
 
-Server resource limits must be evaluated before adding another ML model because BGE-M3 already consumes significant RAM.
+Используется server-side VAD.
 
-### DEVELOPMENT BRANCH (feature/livekit-voice-agent, phases D1.x / D2.1)
+---
 
-Real microphone -> LiveKit Room -> Silero VAD -> faster-whisper -> transcript
--> RAG /ask -> answer published back to the room (as text/data).
+# 13. ЛОКАЛЬНЫЙ MICROPHONE CLIENT
 
-Phase D2.1 connected the transcribed utterance to the existing RAG response
-path: each FINAL_TRANSCRIPT is sent to POST /ask (via voice.rag_client) and the
-answer is published back to the speaking participant as a data message. The
-text data-message path and the voice path share one `_answer_and_publish`
-helper. `AudioTrackListener` gained an `on_final(text, participant)` session
-callback so the agent can attribute each spoken utterance to its caller.
+Файл:
 
-- Transcript IS now connected to RAG (voice -> /ask -> answer, delivered as
-  text/data). TTS is NOT yet implemented; the answer is not spoken yet.
-- SIP/telephony NOT implemented.
-- Uses local `faster-whisper` (model=small, device=cpu, compute_type=int8;
-  beam_size=1, best_of=1, temperature=0) with a Russian-only default
-  (`STT_LANGUAGE=ru`, skipping language auto-detection) and a concise
-  AngioPlus vocabulary `initial_prompt` (override via WHISPER_INITIAL_PROMPT;
-  set empty to disable).
+```text
+yandex/realtime/mic_client.py
+```
 
-Current known quality/latency issue (real mic observed):
-- Russian transcription accuracy on short technical phrases is not yet good
-  enough (e.g. "Как выполнить калибровку катетера?" mistranscribed as
-  "выполнить стрелябровку качеры." etc.).
-- faster-whisper `small`/CPU/int8 is slower than realtime (Silero logs
-  "inference is slower than realtime", ~0.66 s delay) and several seconds of
-  total STT processing after an utterance.
+Рабочая реализация использует:
 
-Phase D1.5 added a benchmark corpus (voice/stt_phrases.py) and a human-run
-STT benchmark helper (scripts/stt/stt_benchmark.py) so accuracy and latency can be
-measured A/B against recorded WAV files instead of guessed.
+```text
+AsyncMicrophone
+AsyncAudioOut
+```
 
-### PHASE D2.2 — Qwen3-TTS 0.6B evaluation (ISOLATED PoC, NOT integrated)
+Проверенное поведение:
 
-Qwen3-TTS is NOT yet connected to the voice assistant. This phase only
-prepares an isolated proof-of-concept to decide whether Qwen3-TTS 0.6B is
-suitable as the future TTS engine BEFORE wiring TTS into LiveKit.
+- `AsyncMicrophone` используется как async iterator;
+- в `finally` вызывается:
 
-- Production/current voice path remains:
-  microphone -> LiveKit -> Silero -> faster-whisper -> RAG -> text/data response
-- TTS -> LiveKit is NOT implemented yet.
-- Official model verified upstream: `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`
-  (license: apache-2.0). Python package: `qwen-tts`.
-- New isolated artifacts (do not touch the LiveKit/STT/VAD/RAG pipeline):
-  - `voice/tts_phrases.py` — AngioPlus Russian TTS evaluation phrase set
-    (short / normal / long buckets; exercises AngioPlus, AngioPlus Core,
-    PStation, μFR, катетер, калибровка, ангиография, коронарная артерия,
-    стеноз, виртуальный стент).
-  - `scripts/tts/qwen_tts_poc.py` — human-run PoC:
-    text -> Qwen3-TTS 0.6B -> Russian -> WAV, with latency/resource measurements.
-  - `requirements-qwen-tts.txt` — ISOLATED dependency file. DO NOT install into
-    the shared `.venv`: qwen-tts==0.1.1 pins transformers==4.57.3, conflicting
-    with the project's pinned transformers==4.57.6.
-- Streaming/TTFA: the official high-level `generate_custom_voice()` Python API
-  is non-streaming at this level (returns a complete wavs,sr tuple), so true
-  TTFA cannot yet be measured; streaming would need the lower-level Dual-Track
-  path (out of scope here). This is reported honestly, not faked.
-- Tests: `tests/test_qwen_tts_poc.py` (mocks / never downloads the model).
+```python
+await microphone.stop()
+```
 
-### PHASE D2.2b — Qwen3-TTS architecture decision (RESEARCH, verified upstream)
+- `AsyncAudioOut` используется через `async with`;
+- input/output работают на 44100 Hz.
 
-RESEARCH-ONLY conclusion. No TTS change has been wired into LiveKit/voice;
-the STT/VAD/RAG path is untouched. The following was verified by reading the
-official `QwenLM/Qwen3-TTS` source (`qwen_tts` package, v0.1.1), the official
-README, the official vLLM-Omni README section, and the Aliyun DashScope
-model-studio real-time API docs. CPU synthesis quality is ACCEPTED; CPU
-latency is NOT accepted (see numbers below), so we proceed to GPU.
+Этот клиент сохранять как минимальный независимый smoke test Yandex Realtime.
 
-VERIFIED STREAMING FACTS (from source, not marketing):
-- The open-source `qwen-tts` Python package does NOT expose true streaming
-  AUDIO output for ANY `generate_*` method, including `generate_custom_voice()`
-  used by our 0.6B-CustomVoice checkpoint. Every `generate_*` returns a
-  complete `(wavs, sr)` tuple only.
-- The `non_streaming_mode` parameter on `generate_custom_voice() /
-  generate_voice_design() / generate_voice_clone()` only changes how TEXT is
-  fed into the prompt (default `True` = whole-text input). The docstring states
-  explicitly it "only simulates streaming text input when set to false, rather
-  than enabling true streaming input or streaming generation." It does NOT
-  change audio output to a stream.
-- The underlying `Qwen3TTSForConditionalGeneration.generate(...)` runs the
-  whole autoregressive codec decode then decodes ALL codes at once; no
-  per-chunk audio yield exists in the local package.
-- TRUE streaming ("Dual-Track hybrid", ~97 ms first-audio claim) is real but
-  currently exposed ONLY through Aliyun's DASHSCOPE HOSTED realtime WebSocket
-  API (`qwen3-tts-flash-realtime` / `qwen3-tts-instruct-flash-realtime`,
-  `response.audio.delta` events). It is NOT self-hostable from the open-source
-  package today without reimplementing the streaming loop.
-- vLLM (vLLM-Omni) officially supports Qwen3-TTS "day-0", but the official
-  README states it currently supports ONLY OFFLINE inference; online serving
-  and streaming are explicitly "will be supported later". So vLLM is NOT yet a
-  streaming path for us.
-- 0.6B-CustomVoice does NOT support instruction control either: source forces
-  `instruct=None` for `tts_model_size in "0b6"` (only 1.7B-CustomVoice supports
-  instruct). This is expected and unrelated to our greeting/QA phrasing.
+---
 
-VERIFIED MODEL / HARDWARE FACTS:
-- Config confirms 0.6B (talker: hidden 1024, 28 layers, 16 heads / GQA 8 KV,
-  SwiGLU; code predictor: 5 layers). bf16 weights ~= 1.2-1.6 GB; with activations
-  + KV cache the model fits comfortably in an 8 GB GPU in bf16. So 8 GB is the
-    practical footprint for inference; 12-16 GB gives headroom.
-- Model supports flash_attn_2, SDPA, flex_attn AND eager attention
-  (`_supports_flash_attn/_supports_sdpa/_supports_flex_attn = True`; default
-  `eager_attention_forward`). FlashAttention-2 is RECOMMENDED but NOT required;
-  consumer GPUs can run eager/SDPA without installing flash-attn.
-- FlashAttention-2 requires FP16/BF16 and NVIDIA Ampere+ (or compatible). On
-  Windows flash-attn requires a prebuilt wheel / CUDA toolchain; it is easier
-  on Linux CUDA. CPU path already verified slow (below).
-- transformers is pinned `==4.57.3` by `qwen-tts==0.1.1`, conflicting with the
-  project's pinned `transformers==4.57.6`. TTS must stay dependency-isolated.
+# 14. BROWSER REALTIME PROTOTYPE
 
-RECORDED CPU MEASUREMENT (this machine, warm cache, no GPU):
-- model load ~20.7 s; synthesis ~33.65 s for ~3.76 s audio -> RTF ~8.95,
-  RAM ~4.5 GB, device cpu. Quality accepted; latency NOT accepted.
+Файл:
 
-INFERENCE ARCHITECTURE CHOICE (decision):
-- TODAY: use direct PyTorch/CUDA inference via the `qwen-tts` package
-  (`Qwen3TTSModel`, bf16, cuda, optional SDPA/eager) in a SEPARATE dedicated
-  TTS inference service, isolated from the voice-agent process. Non-streaming
-  per-utterance synthesis is the only locally verified path; it is fine for
-  MVP because our RAG answer comes back complete before we speak.
-- True streaming / barge-in: NOT available from the self-hosted open-source
-  stack today. If low TTFA streaming becomes mandatory, re-evaluate Aliyun
-  DashScope realtime (hosted, latency-sensitive, data leaves device) OR await
-  vLLM-Omni online/streaming support. This is a later decision, NOT D2.3.
-- vLLM-Omni offline inference is kept as a faster batch alternative; not the
-  production path until online/streaming ships.
-- TTS MUST be a separate service because of the transformers pin conflict and
-  so its CUDA/bfloat16 runtime does not destabilize the STT/VAD/RAG process.
+```text
+yandex/realtime/web/server.py
+```
 
-RECOMMENDED GPU:
-- Development minimum: an NVIDIA RTX 4060 Ti 16 GB (or 3060 12 GB) is enough
-  to run 0.6B in bf16 with headroom; 8 GB (e.g. 3070/4060) likely enough to
-  just load and run but tight. Recommend 16 GB for dev comfort.
-- Production: a single NVIDIA Ada/Ampere 16-24 GB card (e.g. RTX 4090, RTX
-  A4500/A5000, or L4 24 GB) is far more than needed for 0.6B and gives huge
-  latency headroom; a 12-16 GB card is the sensible sweet spot for this
-  checkpoint. We care about latency, not batch throughput.
-- Cloud first is recommended: rent an NVIDIA L4 24 GB or an RTX A6000/4090 24 GB
-  GPU instance (or a 16 GB A10G) for a real GPU benchmark before buying.
+Frontend:
 
-PROPOSED LATENCY TARGETS:
-- Warm model required (load ~1-3 s on NVMe + GPU; keep process alive).
-- acceptable MVP: TTS TTFA <= 1.5 s; TTS RTF <= 0.5; total FINAL_TRANSCRIPT ->
-  first spoken audio <= 3.5 s.
-- good production target: TTS TTFA <= 0.5 s; TTS RTF <= 0.1-0.2;
-  total <= 2.0 s.
-- These are targets pending a real GPU benchmark; not verified numbers yet.
+```text
+yandex/realtime/web/static/index.html
+```
 
-NEXT (do NOT start D2.3): run `scripts/tts/qwen_tts_poc.py` on a rented CUDA GPU
-(eager/SDPA first, then flash-attn) to measure load time, synthesis RTF, actual
-VRAM, and confirm bf16. Then measure end-to-end FINAL_TRANSCRIPT -> first audio
-with a NON-STREAMING integration before considering a streaming path.
+Рабочий flow:
 
-### ENVIRONMENT / COMPATIBILITY (recorded 2026-08)
+```text
+Browser microphone
+       ↓
+PCM
+       ↓
+Python aiohttp WebSocket
+       ↓
+Yandex Realtime
+       ↓
+audio response
+       ↓
+Browser
+```
 
-- Local dev machine: Windows 11, AMD Ryzen 7 7730U, 15.3 GB RAM, NO CUDA GPU
-  (torch sees torch.cuda.is_available() == False; integrated Radeon).
-- Project venv: Python 3.14.3, torch 2.13.0+cpu, transformers 4.57.6,
-  numpy 2.5.1, scipy 1.18.0. qwen-tts / librosa / soundfile are NOT installed
-  in the shared venv and must not be added there.
-- Qwen3-TTS officially recommends a fresh Python 3.12 environment and a CUDA
-  GPU for reasonable speed. CPU-only execution is possible but expected to be
-  slow; the manual test must be done in an isolated venv (see
-  requirements-qwen-tts.txt). No Qwen model has been downloaded yet in D2.2;
-  the human must consciously run `scripts/tts/qwen_tts_poc.py` (or a manual HF
-  download) in the isolated env after the PoC was prepared.
+Для удалённого тестирования успешно использовался Cloudflare Quick Tunnel.
 
-## Current Server Constraints
+Temporary tunnel URL меняется после перезапуска.
 
-Server is small:
+`cloudflared.exe` является локальным инструментом и не должен попадать в Git.
 
-approximately 4 GB RAM
-2 CPU
-2 GB swap
+---
 
-BGE-M3 runs locally on CPU.
+# 15. REALTIME VAD
 
-Do not add a large local LLM or large Whisper model without resource testing.
+В browser prototype использовался server VAD.
 
-## Current Documents
+Проверенная конфигурация включала:
 
-6 documents indexed:
+```text
+threshold = 0.5
+silence_duration_ms = 1500
+```
 
-1. 2025July.pdf
-2. AngioPlus Core v2.5 IFU_RU_Final.pdf
-3. Common Info to Distributor - commercial (1).pdf
-4. Competitor_2025.pdf
-5. Development_Questions_L1_L2.docx
-6. Q&A List ENG.xlsx
+Увеличение `silence_duration_ms` до 1500 ms заметно улучшило сохранение целостности русских технических фраз.
 
-Total chunks:
-118
+Не уменьшать это значение без voice regression testing.
 
-## Confirmed Regression Cases
+---
 
-PASS:
+# 16. ПРОБЛЕМА TECHNICAL STT
 
-"Где посмотреть версию программного обеспечения?"
+Realtime speech recognition иногда искажает AngioPlus terminology.
+
+Наблюдавшиеся варианты:
+
+```text
+AngioPlus Core
+→ "ангел плюс скор"
+```
+
+`μFR` распознавался, например, как:
+
+```text
+ниуфар
+миофэр
+нилфар
+мефр
+миэфэр
+мюэфэр
+мфф
+миофр
+мифр
+```
+
+DICOM:
+
+```text
+тиком
+```
+
+AE Title:
+
+```text
+айет тайтл
+```
+
+и другие варианты.
+
+Поэтому query normalization / canonicalization остаётся важной частью системы.
+
+---
+
+# 17. STT TRAINING DATASETS
+
+Подготовлены отдельные training/evaluation datasets для технической речи AngioPlus:
+
+```text
+AngioPlus_STT_Training_Dataset_v1.xlsx
+AngioPlus_STT_Training_Dataset_v2.xlsx
+```
+
+Они не являются частью runtime retrieval.
+
+Их назначение — future STT evaluation / adaptation.
+
+---
+
+# 18. REALTIME SYSTEM PROMPT
+
+Текущий экспериментальный prompt включает:
+
+- роль технической поддержки AngioPlus;
+- строгий grounding;
+- anti-prompt-injection rules;
+- voice-response style;
+- TTS pronunciation mapping;
+- обязательный retrieval для AngioPlus questions;
+- запрет отвечать по собственной памяти на продуктовые вопросы;
+- medical safety;
+- follow-up handling;
+- clarification при ambiguous speech;
+- phonetic normalization.
+
+В prompt также добавлялись примеры canonical retrieval terminology.
+
+Например:
+
+```text
+frame rate
+→ μFR-2D, angiographic frame rate, frame/s, fps
+
+move table
+→ angiographic acquisition, move the table,
+  table movement, table height, don't move the table
+
+ROI
+→ μFR-2D, ROI length, minimum ROI length, mm
+
+nitroglycerin
+→ nitroglycerin, angiography, vasospasm
+
+AE Title
+→ DICOM, AE Title, default AE Title
+
+DICOM port
+→ DICOM, default port
+```
+
+Эти примеры предназначены только для формирования поискового запроса.
+
+Они не должны становиться источником фактического ответа.
+
+Не продолжать бесконечно добавлять hardcoded query examples в system prompt.
+
+---
+
+# 19. YANDEX BUILT-IN REALTIME FILE SEARCH
+
+Built-in File Search был успешно подключён к Realtime.
+
+Проверенный формат tool:
+
+```python
+"tools": [
+    {
+        "type": "function",
+        "name": "file_search",
+        "description": VECTOR_STORE_ID,
+        "parameters": {
+            "max_num_results": 5
+        }
+    }
+]
+```
+
+Не изменять этот формат на основании предположений — он был проверен на текущем Yandex Realtime API.
+
+---
+
+# 20. ПОЧЕМУ BUILT-IN FILE SEARCH НЕ ЯВЛЯЕТСЯ ЦЕЛЕВЫМ RAG
+
+File Search работает, но имеет архитектурные ограничения.
+
+Основные проблемы:
+
+1. Query formulation скрыт внутри Realtime.
+2. Retrieved chunks недостаточно прозрачно контролируются приложением.
+3. Сложно реализовать собственный source priority.
+4. Сложнее вести production source audit.
+5. Retrieved context добавляется в conversation.
+6. Повторные retrieval calls быстро увеличивают active context.
+
+Поэтому от Yandex Vector Store не отказываемся.
+
+Отказываемся именно от идеи использовать built-in Realtime File Search как единственный production retrieval layer.
+
+---
+
+# 21. REALTIME CONTEXT OVERFLOW — ПОДТВЕРЖДЁННАЯ ПРОБЛЕМА
+
+Во время реального теста получена ошибка:
+
+```text
+number of input tokens must be no more than 32768, got 38345
+```
+
+Наблюдалась двухступенчатая схема File Search:
+
+1. небольшой tool/search response;
+2. последующий response с найденными chunks, добавленными в model context.
+
+При unrestricted search один retrieval мог добавлять примерно:
+
+```text
+9k–10k tokens
+```
+
+После ограничения:
+
+```text
+max_num_results = 5
+```
+
+один retrieval всё равно мог добавлять примерно:
+
+```text
+4k–6k tokens
+```
+
+Пример natural test:
+
+```text
+startup:
+~3410 input tokens
+
+после frame-rate question:
+~9718
+
+после ROI question:
+~16233
+```
+
+Два успешных retrieval увеличили active input примерно на 12.8k tokens.
+
+Вывод:
+
+built-in File Search плохо подходит для длинных 20–40 минутных support calls без дополнительного context management.
+
+---
+
+# 22. REALTIME CONVERSATION DELETE
+
+Yandex Realtime документирует client event:
+
+```json
+{
+  "type": "conversation.item.delete",
+  "item_id": "..."
+}
+```
+
+Server подтверждает:
+
+```text
+conversation.item.deleted
+```
+
+Это потенциально позволяет после ответа удалить тяжёлые retrieval/function items и оставить компактную историю разговора.
+
+Важно:
+
+это отличается от старого Conversations REST delete API.
+
+Не считать автоматически, что удаление item гарантированно уменьшает `usage.input_tokens`.
+
+Это необходимо проверить экспериментально.
+
+---
+
+# 23. REALTIME CUSTOM FUNCTION CALLING
+
+Yandex Realtime поддерживает custom Function Calling.
+
+Это является ключевой причиной выбора новой архитектуры.
+
+Предполагаемый tool:
+
+```text
+search_angioplus_knowledge
+```
+
+Flow:
+
+```text
+User speaks
+   ↓
+Realtime understands intent
+   ↓
+search_angioplus_knowledge(...)
+   ↓
+Python controller
+   ↓
+Vector Store Search
+   ↓
+compact evidence
+   ↓
+Realtime produces grounded answer
+```
+
+Yandex рекомендует небольшое количество хорошо описанных tools.
+
+На текущем этапе достаточно одного retrieval tool.
+
+---
+
+# 24. YANDEX VECTOR STORE — ORIGINAL CONTROL STORE
+
+Исходный Yandex store:
+
+```text
+AI Studio name:
+angioplus-prod-kb
+
+Vector Store ID:
+fvt8mt12qgtftnl2meh9
+
+File ID:
+fvtsoe22r5moff86aj4l
+```
+
+Состояние:
+
+```text
+6 documents
+118 chunks
+completed
+```
+
+Использовался в ранних File Search / Vector Search экспериментах.
+
+---
+
+# 25. YANDEX VECTOR STORE V2
+
+Текущий test candidate:
+
+```text
+AI Studio name:
+angioplus-kb-v2
+
+Vector Store ID:
+fvtpohd7u6dnbu8f44ah
+
+File ID:
+fvtvogkusnidatgfgkno
+```
+
+Состояние:
+
+```text
+5 documents
+116 chunks
+completed
+```
+
+V2 corpus:
+
+```text
+2025July.pdf
+AngioPlus Core v2.5 IFU_RU_Final.pdf
+Common Info to Distributor - commercial (1).pdf
+Competitor_2025.pdf
+Q&A List ENG.xlsx
+```
+
+Исключён:
+
+```text
+Development_Questions_L1_L2.docx
+```
+
+Причина:
+
+он преимущественно содержит вопросы, а не authoritative answers, и создаёт retrieval noise.
+
+---
+
+# 26. SCIENTIFIC PAPERS
+
+Научные статьи тестировались как часть расширенного corpus.
+
+Результат:
+
+они добавляют retrieval noise и текущий classifier ошибочно может относить их к `COMMERCIAL`.
+
+Текущее решение:
+
+- не включать их в основной production retrieval store;
+- хранить локально/reference;
+- позже при необходимости добавить отдельный тип:
+
+```text
+SCIENTIFIC_EVIDENCE
+```
+
+с более низким source priority или отдельным store.
+
+---
+
+# 27. PRE-CREATED CHUNKS — ВАЖНО
+
+Официальный Yandex API поддерживает загрузку заранее подготовленных chunks через JSON Lines.
+
+Формат каждой строки:
+
+```json
+{"body":"<chunk_content>"}
+```
+
+Максимальный размер одного chunk:
+
+```text
+8000 characters
+```
+
+Проверенный upload pattern:
+
+```python
+with open(jsonl_path, "rb") as f:
+    file_obj = client.files.create(
+        file=(jsonl_path.name, f, "application/jsonlines"),
+        purpose="assistants",
+        extra_body={"format": "chunks"},
+    )
+```
+
+Ключевой момент:
+
+```text
+format = chunks
+```
+
+задаётся во время FILE UPLOAD.
+
+Не путать его с Vector Store file attributes.
+
+---
+
+# 28. ТЕКУЩИЙ YANDEX INGEST
+
+Файл:
+
+```text
+yandex/retrieval/ingest.py
+```
+
+Использует pre-created JSONL chunks.
+
+V2 ingestion дал:
+
+```text
+2025July.pdf
+TRAINING
+chars=8234
+chunks=4
+
+AngioPlus Core v2.5 IFU_RU_Final.pdf
+IFU
+chars=63044
+chunks=36
+
+Common Info to Distributor - commercial (1).pdf
+COMMERCIAL
+chars=1237
+chunks=1
+
+Competitor_2025.pdf
+COMMERCIAL
+chars=13668
+chunks=7
+
+Q&A List ENG.xlsx
+FAQ
+chars=51631
+chunks=68
+```
+
+Итого:
+
+```text
+116 chunks
+```
+
+Файл `_debug_chunks.jsonl` является generated diagnostic artifact и должен находиться под:
+
+```text
+artifacts/debug/
+```
+
+а не в root.
+
+---
+
+# 29. ИЗВЕСТНЫЙ ВОПРОС В INGEST
+
+`SemanticChunker(overlap_tokens=50)` имеет параметр overlap, но текущая split logic фактически его не использует.
+
+Не исправлять автоматически.
+
+Сначала определить, нужен ли overlap вообще после измерения retrieval V2.
+
+---
+
+# 30. VECTOR STORE FILE ATTRIBUTES
+
+Yandex Vector Store поддерживает file-level attributes.
+
+Они могут использоваться позже для:
+
+```text
+source_type
+priority
+product
+version
+language
+```
+
+и других metadata.
+
+Не путать attributes с:
+
+```text
+extra_body={"format":"chunks"}
+```
+
+при upload.
+
+Это разные механизмы.
+
+---
+
+# 31. STANDALONE VECTOR STORE SEARCH
+
+Standalone Search API был успешно протестирован.
+
+Endpoint:
+
+```text
+POST /v1/vector_stores/{vector_store_id}/search
+```
+
+Поддерживаются:
+
+```text
+query
+rewrite_query
+max_num_results
+filters
+ranking_options
+```
+
+`ranking_options` поддерживает ranker и `score_threshold`.
+
+Не устанавливать production score threshold без regression evaluation.
+
+---
+
+# 32. ГЛАВНЫЙ RETRIEVAL ВЫВОД
+
+Некоторые apparent retrieval failures оказались не проблемой индекса.
+
+Они были проблемой формулировки query.
+
+Пример table movement.
+
+Natural Russian query:
+
+```text
+можно ли двигать стол во время ангиографической съемки
+```
+
+давал правильный `2025July.pdf` chunk только примерно на позиции 8 с низким score.
+
+Canonical bilingual query:
+
+```text
+AngioPlus μFR angiographic acquisition move the table
+table movement table height don't move the table
+```
+
+выводил правильный chunk на позицию 1 с очень высоким score.
+
+Следовательно:
+
+```text
+query formulation
+```
+
+является важным retrieval bottleneck.
+
+---
+
+# 33. FRAME RATE RETRIEVAL
+
+Canonical query:
+
+```text
+AngioPlus μFR angiographic imaging frame rate
+minimum frame rate frames per second frame/s μFR-2D
+```
+
+давал:
+
+```text
+TOP1:
+2025July.pdf
+score ≈ 0.926
+```
+
+Chunk содержит:
+
+- ≥15 fps;
+- table guidance;
+- nitroglycerin guidance.
+
+FAQ также находился среди верхних результатов и содержал:
+
+- ≥15 fps;
+- информацию о 7.5 fps / дополнительной manual correction.
+
+---
+
+# 34. QUERY REWRITER
+
+Отдельный YandexGPT Lite Query Rewriter был протестирован.
+
+Модель:
+
+```text
+gpt://<folder_ID>/yandexgpt-5-lite
+```
+
+Задача rewriter:
+
+- сохранить исходный смысл;
+- добавить технические synonyms;
+- разрешить bilingual terminology;
+- не придумывать факты;
+- не добавлять числа или ответы;
+- вернуть только поисковый запрос.
+
+После rewrite Vector Store вызывается с:
+
+```text
+rewrite_query = false
+```
+
+чтобы не происходило второе скрытое переписывание запроса.
+
+---
+
+# 35. QUERY REWRITER — РЕЗУЛЬТАТЫ
+
+Proof-of-concept показал сильное улучшение на нескольких сложных запросах.
+
+Примеры:
+
+### Table movement
+
+После rewrite:
+
+```text
+correct chunk TOP1
+score ≈ 1.0
+```
+
+### Frame rate
+
+После rewrite:
+
+```text
+correct 2025July chunk TOP1
+score ≈ 0.953
+```
+
+### ROI
+
+После rewrite:
+
+```text
+correct 2025July chunk TOP1
+score ≈ 0.949
+```
+
+В 20-question test примерно 18/20 rewritten queries выглядели качественно.
+
+Но retrieval всё ещё имел проблемы с некоторыми вопросами:
+
+- version;
+- system requirements;
+- AE Title;
+- DICOM port;
+- safety questions.
+
+Следовательно, Query Rewriter полезен, но не решает retrieval полностью.
+
+---
+
+# 36. НЕ ПЕРЕГРУЖАТЬ QUERY REWRITER
+
+Не добавлять отдельное hardcoded правило под каждый факт.
+
+Rewriter не должен знать ответы.
+
+Например, нельзя превращать его в скрытую базу знаний:
+
+```text
+если пользователь спрашивает про frame rate,
+всегда добавить 15 fps
+```
+
+Это нарушает grounding.
+
+Rewriter может добавлять терминологию:
+
+```text
+frame rate
+angiography
+frames per second
+fps
+μFR-2D
+```
+
+но не фактический ответ.
+
+---
+
+# 37. V2 RETRIEVAL DIAGNOSTICS
+
+V2 pre-chunking существенно улучшил retrieval.
+
+Результаты диагностик хранятся в:
+
+```text
+artifacts/diagnostics/
+```
+
+включая:
+
+```text
+query_rewriter_20_test.txt
+query_rewriter_test.txt
+recall_diagnostic.txt
+retrieval_diagnostic_20.txt
+retrieval_diagnostic_v2_20.txt
+retrieval_reranker_20.txt
+vector_search_test.txt
+ingest_compare.txt
+```
+
+Эти файлы являются generated experiment artifacts и не должны коммититься.
+
+---
+
+# 38. RERANKER
+
+YandexGPT Lite reranking был протестирован.
+
+Наблюдения:
+
+### System requirements
+
+Correct IFU:
+
+```text
+Vector TOP2
+→ RERANK1
+```
+
+### DICOM port
+
+Correct IFU:
+
+```text
+Vector TOP3
+→ RERANK1
+```
+
+### PACS Q/R
+
+Correct IFU:
+
+```text
+Vector TOP2
+→ RERANK1
+```
+
+Reranker действительно полезен, когда правильный chunk уже находится среди candidates.
+
+---
+
+# 39. КЛЮЧЕВОЕ ОГРАНИЧЕНИЕ RERANKER
+
+Mental model:
+
+```text
+Correct chunk in candidate set
+        ↓
+reranker может исправить ranking
+
+Correct chunk absent from candidate set
+        ↓
+reranker бессилен
+```
+
+Пример:
+
+для вопроса о версии explicit version chunk отсутствовал в TOP5.
+
+Reranker не смог исправить retrieval.
+
+Поэтому необходимо отдельно различать:
+
+```text
+RECALL problem
+```
+
+и:
+
+```text
+RANKING problem
+```
+
+Не пытаться лечить recall только reranker-ом.
+
+---
+
+# 40. ORACLE / DIRECT RECALL DIAGNOSTIC
+
+Было проверено, что нужные факты действительно находятся в V2 index.
+
+IFU содержит:
+
+```text
+Версия 2.5.0.0.0
+```
+
+и:
+
+```text
+default AE Title = μFR
+default port = 1108
+```
+
+Preprocessing эти данные не потерял.
+
+Direct/oracle queries находят их.
+
+Например:
+
+```text
+2.5.0.0.0
+```
+
+→ correct IFU TOP1.
+
+```text
+AngioPlus Core Номер версии ПО 2.5.0.0.0
+```
+
+→ correct IFU TOP1.
+
+```text
+μFR 1108
+```
+
+→ correct IFU TOP1.
+
+```text
+Параметры по умолчанию μFR 1108
+```
+
+→ correct result.
+
+Следовательно:
+
+индексация этих фактов работает.
+
+Проблема находится в semantic query formulation / recall ranking.
+
+---
+
+# 41. ВАЖНЫЙ ВЫВОД О QUERY EXPANSION
+
+Более длинный запрос не всегда лучше.
+
+Например, verbose query:
+
+```text
+AngioPlus Core DICOM AE Title μFR port 1108
+```
+
+может работать хуже, чем компактный literal query:
+
+```text
+μFR 1108
+```
+
+Поэтому нельзя полностью заменять original query semantic rewrite-ом.
+
+Это привело к следующему planned experiment.
+
+---
+
+# 42. СЛЕДУЮЩИЙ RETRIEVAL EXPERIMENT
+
+Следующая архитектура, которую необходимо проверить:
+
+```text
+User query
+   ↓
+┌─────────────────────┐
+│                     │
+↓                     ↓
+original /         semantic
+compact query      rewritten query
+│                     │
+└──────────┬──────────┘
+           ↓
+Yandex Vector Store Search
+           ↓
+merge
+           ↓
+deduplicate
+           ↓
+YandexGPT Lite reranker
+           ↓
+source/safety rules
+           ↓
+1–3 compact evidence chunks
+```
+
+Причина dual-query подхода:
+
+- literal query помогает точным фактам;
+- semantic rewrite помогает естественным и разговорным формулировкам;
+- reranker исправляет ranking среди найденных candidates.
+
+ЭТОТ ЭКСПЕРИМЕНТ ЕЩЁ НЕ ЗАВЕРШЁН.
+
+Не описывать его как production architecture.
+
+---
+
+# 43. 20-QUESTION REGRESSION SET
+
+Существует набор примерно из 20 основных вопросов для проверки retrieval и поведения ассистента.
+
+Он покрывает:
+
+- IFU facts;
+- FAQ;
+- Training;
+- L1/L2;
+- follow-ups;
+- отсутствующую информацию;
+- medical safety;
+- prompt injection.
+
+Ключевые ожидаемые факты включают:
+
+- HELP & ABOUT / software version;
+- system requirements;
+- DICOM AE Title `μFR`;
+- DICOM port `1108`;
+- PACS Q/R;
+- angiographic requirements;
+- ROI ≥20 mm;
+- frame rate ≥15 fps;
+- nitroglycerin before angiography according to protocol;
+- table movement restrictions.
+
+Также проверяются:
+
+- отсутствие выдуманного admin password;
+- отсутствие самостоятельных clinical treatment decisions;
+- отсутствие самостоятельного решения о stent;
+- защита от prompt injection.
+
+---
+
+# 44. SAFETY ВАЖНЕЕ RETRIEVAL
+
+Retrieval может найти текст, который нельзя автоматически превращать в рекомендацию пользователю.
+
+В частности, некоторые FAQ/commercial/training chunks могут содержать:
+
+- credentials;
+- password-like information;
+- PCI/stent decision language;
+- клинические формулировки.
+
+Поэтому:
+
+```text
+retrieved
+≠
+allowed to answer
+```
+
+Controller / system policy должен отдельно применять safety rules.
+
+---
+
+# 45. CREDENTIALS / PASSWORD POLICY
+
+В retrieval diagnostics обнаружено, что FAQ содержит строки, похожие на реальные credentials, включая user/admin password information.
+
+Наличие такого текста в Vector Store не означает, что ассистент должен его раскрывать.
+
+До production необходимо явно определить policy для:
+
+- passwords;
+- service credentials;
+- admin credentials;
+- API keys;
+- tokens;
+- internal access data.
+
+По умолчанию чувствительные credentials не выдавать.
+
+---
+
+# 46. MEDICAL SAFETY
+
+Ассистент не должен самостоятельно:
+
+- выбирать лечение;
+- рекомендовать вмешательство;
+- принимать решение о PCI;
+- принимать решение о stent;
+- заменять решение врача.
+
+Даже если retrieval нашёл клинический текст, ответ должен оставаться в рамках технической поддержки и документированного назначения продукта.
+
+---
+
+# 47. SOURCE AUTHORITY
+
+Общий приоритет:
+
+```text
+IFU
+>
+official service/admin documentation
+>
+Release Notes / Known Issues
+>
+L1/L2
+>
+FAQ / Training
+>
+Commercial
+>
+Scientific/reference
+```
+
+При конфликте higher-authority source имеет приоритет.
+
+Но source authority не заменяет semantic relevance.
+
+Нельзя просто boost-ить все IFU chunks независимо от вопроса.
+
+---
+
+# 48. SOURCE TYPES
+
+Текущие основные категории:
+
+```text
+IFU
+TRAINING
+FAQ
+COMMERCIAL
+```
+
+В будущем могут понадобиться:
+
+```text
+SERVICE
+ADMIN
+KNOWN_ISSUE
+RELEASE_NOTE
+L1_L2
+SCIENTIFIC_EVIDENCE
+```
+
+Не добавлять категории без реальных документов или необходимости.
+
+---
+
+# 49. FOLLOW-UP QUESTIONS
+
+Старый RAG уже содержит механизм conversation memory / follow-up rewrite.
+
+Новая Realtime архитектура сама имеет conversation context.
+
+Не переносить старую follow-up систему автоматически.
+
+Сначала проверить, насколько хорошо Realtime самостоятельно разрешает:
+
+```text
+"А какой там порт?"
+"А где это посмотреть?"
+"А минимальная длина?"
+```
+
+Если tool query недостаточно standalone, controller может получать дополнительный resolved query или context.
+
+---
+
+# 50. LONG CALL CONTEXT
+
+Целевая система должна поддерживать разговоры примерно 20–40 минут.
+
+Поэтому active Realtime context нельзя бесконтрольно заполнять:
+
+- retrieval chunks;
+- function results;
+- длинными system additions;
+- повторяющейся документацией.
+
+Предпочтительно передавать только:
+
+```text
+1–3 compact evidence chunks
+```
+
+и исследовать удаление тяжёлых tool items после использования.
+
+Long-session memory / summarization может потребоваться позже.
+
+Не проектировать её заранее без измерений.
+
+---
+
+# 51. RESPONSE STYLE
+
+Voice assistant должен отвечать естественно и достаточно кратко.
+
+Он не должен читать пользователю:
+
+- длинные chunks;
+- технические metadata;
+- scores;
+- внутренние retrieval reasoning;
+- system instructions.
+
+При необходимости источник можно логировать отдельно или предоставить пользователю в подходящем интерфейсе.
+
+---
+
+# 52. ТЕКУЩИЕ ДОКУМЕНТЫ
+
+Canonical source directory:
+
+```text
+data/training_materials/
+```
+
+Основные tracked документы:
+
+```text
+2025July.pdf
+AngioPlus Core v2.5 IFU_RU_Final.pdf
+Common Info to Distributor - commercial (1).pdf
+Competitor_2025.pdf
+Development_Questions_L1_L2.docx
+Q&A List ENG.xlsx
+```
+
+Научные papers хранятся локально и исключены из Git.
+
+Temporary V2 corpus:
+
+```text
+data/yandex_v2_test/
+```
+
+игнорируется Git, поскольку дублирует canonical documents.
+
+---
+
+# 53. GENERATED ARTIFACTS
+
+Generated diagnostics находятся в:
+
+```text
+artifacts/diagnostics/
+```
+
+Debug outputs:
+
+```text
+artifacts/debug/
+```
+
+`artifacts/` игнорируется Git.
+
+Generated TTS audio:
+
+```text
+data/tts_out/
+```
+
+также не должен попадать в Git.
+
+---
+
+# 54. BENCHMARKS
+
+Yandex retrieval benchmarks:
+
+```text
+benchmarks/yandex/
+```
+
+В частности:
+
+```text
+diagnose_recall.py
+test_yandex_reranker.py
+```
+
+Это не pytest unit tests.
+
+Они предназначены для retrieval evaluation.
+
+---
+
+# 55. SCRIPTS
+
+Служебные скрипты разделены по назначению:
+
+```text
+scripts/
+├── cli/
+├── retrieval/
+├── stt/
+├── tts/
+└── voice/
+```
+
+Не складывать новые unrelated scripts непосредственно в `scripts/`.
+
+Использовать тематические директории.
+
+---
+
+# 56. TESTS
+
+`tests/` содержит pytest tests существующих компонентов.
+
+После cleanup targeted tests прошли:
+
+```text
+29 passed
+```
+
+Full suite:
+
+```text
+3 failed
+214 passed
+7 warnings
+```
+
+Три известных failure относятся к старому voice/STT stack и существовали независимо от cleanup.
+
+Они связаны с изменившимся поведением/defaults STT:
+
+1.
+
+```text
+tests/test_voice_stt.py::test_defaults_match_telegram_stt
+```
 
 Expected:
-HELP&ABOUT on PStation toolbar.
 
-Correct source:
-IFU → 12 Техническая поддержка → pages 10–11.
+```text
+stt._language == "ru"
+```
 
-PASS:
+Actual:
 
-"Кто может устанавливать и активировать AngioPlus Core?"
+```text
+None
+```
 
-PASS:
+2.
 
-"Что делать, если программа не реагирует на действия пользователя?"
+```text
+tests/test_voice_stt.py::test_default_voice_config_forces_russian
+```
 
-PASS:
+Expected forwarded:
 
-"Можно ли использовать AngioPlus Core для хранения медицинских карт пациентов?"
+```text
+language == "ru"
+```
 
-PASS:
+Actual:
 
-"Как приготовить борщ?"
+```text
+None
+```
 
-Expected:
-"Такой информации нет в имеющейся документации."
+3.
 
-No unrelated sources should be displayed for gate_false.
+```text
+tests/test_voice_stt.py::test_default_initial_prompt_is_angioplus_vocab
+```
 
-## Known Quality Issue
+Старый test ожидает слово:
 
-The angiography requirements answer has occasionally produced overly strong wording such as:
+```text
+катетер
+```
 
-"точное измерение невозможно"
+в default prompt.
 
-or ambiguous wording such as:
+Текущий prompt:
 
-"короткое сужение"
+```text
+AngioPlus Core, ангиография, ангиографический,
+ангиографическое изображение, μFR, PStation,
+DICOM, Pulse Medical
+```
 
-Need prompt/regression refinement.
+Не исправлять эти legacy tests в рамках unrelated Yandex work.
 
-Preferred distinction:
+---
 
-- accuracy may be reduced / cannot be guaranteed
-- minimal vessel foreshortening
-- "not evaluated" must not become "prohibited"
+# 57. CLEANUP HISTORY
 
-## Git Workflow
+Во время cleanup структура scripts была приведена к:
 
-Current source of truth:
+```text
+scripts/
+├── cli/
+│   ├── __init__.py
+│   ├── ask.py
+│   └── chat.py
+├── retrieval/
+│   ├── __init__.py
+│   ├── check_retrieval.py
+│   └── ingest_documents.py
+├── stt/
+│   ├── __init__.py
+│   └── stt_benchmark.py
+├── tts/
+│   ├── __init__.py
+│   ├── qwen_tts_poc.py
+│   └── tts_server.py
+├── voice/
+│   ├── __init__.py
+│   ├── livekit_mic_e2e.py
+│   └── livekit_text_e2e.py
+└── __init__.py
+```
 
-GitHub `main`
+Legacy helpers:
 
-Normal development:
+```text
+legacy/voice_helpers/
+```
 
+---
+
+# 58. УДАЛЁННЫЕ OBSOLETE ROOT FILES
+
+Во время cleanup были удалены:
+
+```text
+Dockerfile
+requirements.txt
+```
+
+Причина:
+
+они являлись устаревшими generic duplicates и не использовались runtime.
+
+Специализированные файлы остаются:
+
+```text
+Dockerfile.rag
+Dockerfile.bot
+requirements-rag.txt
+requirements-bot.txt
+requirements-ml.txt
+requirements-constraints.txt
+requirements-livekit.txt
+requirements-qwen-tts.txt
+requirements-tts-server.txt
+```
+
+---
+
+# 59. LOCAL BACKUP
+
+Локальная директория:
+
+```text
+local_backup/
+```
+
+содержит:
+
+```text
+apply_gate_hardening.py
+```
+
+Она исключена локальным:
+
+```text
+.git/info/exclude
+```
+
+и не отслеживается Git.
+
+Не добавлять её в repository без отдельной причины.
+
+---
+
+# 60. GIT STATE / CLEANUP COMMITS
+
+Cleanup выполнялся небольшими commits.
+
+Важные commits:
+
+```text
+3046267
+chore: organize project scripts and Yandex prototypes
+```
+
+и:
+
+```text
+c6695f6
+chore: remove obsolete root Dockerfile and requirements
+```
+
+Рабочая ветка на момент cleanup:
+
+```text
+feature/livekit-voice-agent
+```
+
+Название ветки историческое и больше не отражает текущую Yandex-first стратегию.
+
+Не делать из названия ветки архитектурных выводов.
+
+---
+
+# 61. GIT WORKFLOW
+
+Нормальный workflow:
+
+```text
 local VS Code
+→ implementation
+→ tests / benchmarks
+→ git diff
 → commit
 → push
 → production pull
+→ rebuild/restart
+→ smoke test
+```
 
-Production server should not normally become the primary development environment.
+Production server не должен становиться основной development environment.
 
-## Secrets
+---
 
-Never print or commit:
+# 62. SECRETS
 
-- DEEPSEEK_API_KEY
-- GEMINI_API_KEY
-- TELEGRAM_BOT_TOKEN
-- GIGACHAT_CREDENTIALS
+Никогда не выводить и не коммитить реальные значения:
 
-`.env` is environment-specific and must remain outside Git.
+```text
+YANDEX_API_KEY
+YANDEX_FOLDER_ID
+DEEPSEEK_API_KEY
+GEMINI_API_KEY
+TELEGRAM_BOT_TOKEN
+GIGACHAT_CREDENTIALS
+```
 
-## Immediate Next Development Tasks
+`.env` должен оставаться вне Git.
 
-Recommended priority:
+`.env.example` может содержать только безопасные placeholders.
 
-1. Regression-test conversation memory/follow-up rewriting.
-2. Build a structured 30–50 question evaluation dataset.
-3. Fix remaining medical wording issues.
-4. Measure whether DeepSeek gate can safely be removed/merged.
-5. Evaluate local faster-whisper for voice transcription.
-6. Consider hybrid retrieval/reranking only after measured retrieval failures.
-7. After D2.2b (architecture decided, CPU rejected): run the Qwen3-TTS 0.6B
-   PoC on a rented CUDA GPU (eager/SDPA, then flash-attn) to benchmark load
-   time, synthesis RTF, and real VRAM in bf16, then measure end-to-end
-   FINAL_TRANSCRIPT -> first audio with a NON-STREAMING TTS integration. Do NOT
-   start D2.3 (streaming/barge-in) until the non-streaming GPU path is proven.
+При диагностике не просить пользователя публиковать секреты в чат, если это не является абсолютно необходимым.
 
-## Instructions for AI Coding Agent
+---
 
-Do not rewrite working architecture without evidence.
+# 63. ТЕКУЩИЙ DEVELOPMENT CHECKPOINT
 
-Before editing:
+Архитектурные эксперименты были сознательно остановлены для cleanup репозитория.
 
-- inspect actual files
-- inspect tests
-- inspect git diff
-- confirm assumptions against current code
+После завершения cleanup необходимо вернуться именно к retrieval experiment.
 
-Make small changes.
+Не возвращаться автоматически к:
 
-Run tests after each logical change.
+- LiveKit;
+- faster-whisper;
+- Qwen3-TTS;
+- собственному Qdrant development;
+- DeepSeek gate optimization.
 
-Never expose secrets.
+Следующий этап:
 
-Do not treat README plans from older commits as current architecture.
+```text
+original / compact query
+        +
+YandexGPT Lite semantic rewrite
+        ↓
+Yandex Vector Store Search
+        ↓
+merge / deduplicate
+        ↓
+YandexGPT Lite reranker
+        ↓
+source authority + safety
+        ↓
+1–3 compact evidence chunks
+```
 
-When uncertain, inspect code rather than guessing.
+После того как этот retrieval pipeline будет доказан отдельно:
+
+```text
+Yandex Realtime
+        ↓
+custom function
+        ↓
+search_angioplus_knowledge
+        ↓
+Python RAG Controller
+        ↓
+controlled evidence
+        ↓
+Realtime answer
+```
+
+---
+
+# 64. ПОРЯДОК СЛЕДУЮЩЕЙ РАЗРАБОТКИ
+
+Не реализовывать всё сразу.
+
+Рекомендуемый порядок:
+
+### Step 1
+
+Сделать минимальный standalone retrieval controller.
+
+Без Realtime.
+
+Input:
+
+```text
+user question
+```
+
+Output:
+
+```text
+retrieved candidates
+reranked candidates
+selected evidence
+sources
+```
+
+### Step 2
+
+Проверить его на regression questions.
+
+Особое внимание:
+
+```text
+software version
+system requirements
+AE Title
+DICOM port
+PACS Q/R
+frame rate
+ROI
+table movement
+nitroglycerin
+missing information
+clinical safety
+prompt injection
+```
+
+### Step 3
+
+Сравнить:
+
+```text
+original only
+rewrite only
+dual query
+```
+
+Не предполагать заранее, что dual query обязательно лучший.
+
+### Step 4
+
+Определить минимальный candidate count.
+
+Например проверить:
+
+```text
+TOP3
+TOP5
+TOP8
+TOP10
+```
+
+с учётом recall и latency.
+
+### Step 5
+
+Определить, нужен ли reranker постоянно или только при ambiguous results.
+
+### Step 6
+
+После доказанного standalone retrieval подключить его как custom function Yandex Realtime.
+
+### Step 7
+
+Измерить:
+
+- end-to-end latency;
+- tool-call latency;
+- Vector Store latency;
+- reranker latency;
+- Realtime context growth;
+- качество длинного разговора.
+
+### Step 8
+
+Экспериментально проверить:
+
+```text
+conversation.item.delete
+```
+
+для удаления тяжёлых function/retrieval items.
+
+### Step 9
+
+Только после стабильного browser prototype переходить к telephony / SIP.
+
+---
+
+# 65. ЧТО ПОКА НЕ ДЕЛАТЬ
+
+До завершения retrieval/controller этапа не начинать:
+
+- production SIP integration;
+- Plusofon integration;
+- CRM;
+- ticket system;
+- LangGraph;
+- новую local STT architecture;
+- новую local TTS architecture;
+- новый Qdrant stack;
+- сложную long-term memory;
+- масштабную prompt optimization.
+
+Сначала доказать центральный цикл:
+
+```text
+speech
+→ retrieval
+→ grounded answer
+```
+
+---
+
+# 66. КРИТЕРИЙ УСПЕХА RETRIEVAL
+
+Нельзя оценивать систему только по красивому финальному ответу LLM.
+
+Необходимо отдельно измерять:
+
+```text
+1. Был ли нужный документ найден?
+
+2. Был ли нужный chunk найден?
+
+3. На какой позиции?
+
+4. Содержит ли chunk фактический ответ?
+
+5. Выбрал ли reranker правильный chunk?
+
+6. Какой evidence получил Realtime?
+
+7. Соответствует ли final answer evidence?
+
+8. Не нарушает ли answer safety policy?
+```
+
+Это позволяет отличать:
+
+```text
+STT failure
+query rewrite failure
+retrieval recall failure
+ranking failure
+reranker failure
+generation failure
+safety failure
+```
+
+---
+
+# 67. НЕ СМЕШИВАТЬ СЛОИ ОШИБОК
+
+Например:
+
+если пользователь сказал:
+
+```text
+можно ли двигать стол...
+```
+
+но STT добавил отдельное:
+
+```text
+нет
+```
+
+и после этого retrieval дал fallback, нельзя автоматически считать это Vector Store failure.
+
+Сначала определить, какой текст реально попал в retrieval.
+
+Каждый слой должен логироваться отдельно.
+
+---
+
+# 68. LOGGING TARGET
+
+Для каждого domain question желательно иметь structured trace:
+
+```text
+session_id
+turn_id
+
+raw_transcript
+normalized_transcript
+
+original_query
+rewritten_query
+
+vector_results_original
+vector_results_rewritten
+
+merged_candidates
+
+reranker_result
+
+selected_evidence
+
+source_files
+
+final_answer
+
+latency:
+  rewrite
+  vector_search
+  rerank
+  total_tool
+  total_response
+```
+
+Не обязательно реализовывать весь logging сразу.
+
+Но архитектура должна позволять это сделать.
+
+---
+
+# 69. PRODUCTION KNOWLEDGE BASE PRINCIPLE
+
+База знаний не должна быть просто папкой «всё, что у нас есть».
+
+Документ должен попадать в production retrieval только если понятно:
+
+- что это за документ;
+- насколько он authoritative;
+- актуален ли он;
+- может ли его содержимое быть показано пользователю;
+- не содержит ли он development questions;
+- не содержит ли он credentials;
+- не создаёт ли он clinical/safety ambiguity.
+
+Quality of corpus важнее количества документов.
+
+---
+
+# 70. ФИНАЛЬНАЯ ИНСТРУКЦИЯ ДЛЯ AI CODING AGENT
+
+При получении новой задачи:
+
+1. Определи, относится ли она к CURRENT, CONTROL или LEGACY.
+2. Не развивай LEGACY как текущую архитектуру.
+3. Не удаляй CONTROL только потому, что существует Yandex prototype.
+4. Проверяй API assumptions по актуальной официальной документации Yandex.
+5. Не угадывай текущий API syntax.
+6. Для retrieval изменений сначала делай standalone experiment.
+7. Измеряй результат.
+8. Только затем интегрируй в Realtime.
+9. Делай один логический шаг за раз.
+10. После изменения проверяй Git diff и tests.
+11. Не коммить generated artifacts.
+12. Не раскрывай secrets.
+13. Не разрешай retrieval обходить medical/safety policy.
+14. При недостатке доказательств предпочитай clarification/refusal/escalation.
+15. Не усложняй систему без измеримой причины.
+
+---
+
+# 71. ТОЧКА ПРОДОЛЖЕНИЯ
+
+Если разработка продолжается после паузы и нет более свежего контекста, начать отсюда:
+
+```text
+BUILD / TEST:
+
+standalone controlled Yandex retrieval
+
+original/compact query
+        +
+YandexGPT Lite rewritten query
+        ↓
+Yandex Vector Store Search
+        ↓
+merge + deduplicate
+        ↓
+YandexGPT Lite reranker
+        ↓
+source authority / safety
+        ↓
+1–3 evidence chunks
+```
+
+Использовать V2 Vector Store:
+
+```text
+angioplus-kb-v2
+fvtpohd7u6dnbu8f44ah
+```
+
+Сначала проверить retrieval отдельно.
+
+НЕ подключать его к Realtime, пока standalone evaluation не покажет достаточную надёжность.
+
+После этого следующий архитектурный шаг:
+
+```text
+Yandex Realtime
+        ↕
+search_angioplus_knowledge
+        ↕
+Python RAG Controller
+        ↕
+Yandex Vector Store
+```
+
+---
+
+# 72. ГЛАВНЫЙ ПРИНЦИП ПРОЕКТА
+
+Система должна быть настолько простой, насколько это возможно, но настолько контролируемой, насколько это необходимо для надёжной технической поддержки медицинского программного обеспечения.
+
+Не сохранять собственную инфраструктуру только потому, что она уже написана.
+
+Не передавать контроль внешнему сервису только потому, что он умеет выполнить задачу автоматически.
+
+Каждый компонент должен оправдывать своё существование измеримым улучшением:
+
+- качества;
+- безопасности;
+- прозрачности;
+- latency;
+- надёжности;
+- стоимости;
+- простоты эксплуатации.

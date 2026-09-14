@@ -1,0 +1,5 @@
+# PostgreSQL-backed channel-agnostic support domain.
+SQLAlchemy>=2.0,<3
+asyncpg>=0.29,<1
+alembic>=1.13,<2
+pydantic-settings>=2.2,<3

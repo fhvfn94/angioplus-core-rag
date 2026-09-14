@@ -20,6 +20,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Layer 3: frequent RAG/app dependencies (openai, FastAPI, Qdrant, readers).
 # Changing these does NOT invalidate the CPU torch / ML layers above.
-COPY requirements-rag.txt ./
+COPY requirements-rag.txt requirements-support.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements-rag.txt
+    pip install -r requirements-rag.txt -r requirements-support.txt

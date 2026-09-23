@@ -3,10 +3,12 @@ SQLAlchemy 2.x ORM models for the support domain.
 
 Tables (FINAL DESIGN v2 + DELTA v3):
 
-  conversations    -- lifecycle / FSM state of a support conversation
-  messages         -- append-only message log
-  inbound_events   -- inbound delivery idempotency (user -> backend)
-  processed_events -- external provider callback idempotency (e.g. Tracker)
+  conversations            -- lifecycle / FSM state of a support conversation
+  messages                 -- append-only message log
+  inbound_events           -- inbound delivery idempotency (user -> backend)
+  processed_events         -- external provider callback idempotency (e.g. Tracker)
+  procedure_states         -- current ProcedureState per conversation (1:1)
+  procedure_state_attempts -- append-only log of recorded step attempts
 
 Key invariants enforced at the DB level:
 
@@ -24,13 +26,16 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
     Identity,
     Index,
+    Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -250,4 +255,126 @@ class ProcessedEvent(Base):
 
     __table_args__ = (
         Index("ix_processed_events_conversation", "conversation_id"),
+    )
+
+
+# ============================================================
+# procedure_states (current per-conversation procedure state)
+# ============================================================
+
+class ProcedureStateRow(Base):
+    """The CURRENT :class:`support.procedure_state.ProcedureState`.
+
+    The domain value object is a frozen dataclass with a tuple of
+    :class:`support.procedure_state.StepAttempt`; it is not itself
+    persistable. This table (plus :class:`ProcedureStateAttemptRow`) is its
+    durable projection, written and read by
+    :class:`support.procedure_state_service.ProcedureStateService`.
+
+    One row per conversation: ``conversation_id`` is both the primary key
+    and a FK, so a conversation owns at most one state row.
+    """
+
+    __tablename__ = "procedure_states"
+
+    conversation_id: Mapped[str] = mapped_column(
+        Text,
+        ForeignKey("conversations.conversation_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    # --- which procedure is being walked (identity only; no cursor) ---
+    issue: Mapped[str | None] = mapped_column(Text, nullable=True)
+    procedure_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    procedure_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # --- what the assistant last advised (a fact about the dialogue) ---
+    last_recommended_step: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- problem-level fact ---
+    problem_status: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'unknown'")
+    )
+
+    # --- clarification fact ---
+    pending_clarification: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    clarification_topic: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- schema ---
+    schema_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "problem_status IN ('unknown','ongoing','resolved')",
+            name="ck_procedure_states_problem_status",
+        ),
+        CheckConstraint(
+            "schema_version >= 1",
+            name="ck_procedure_states_schema_version",
+        ),
+    )
+
+
+# ============================================================
+# procedure_state_attempts (append-only step-attempt log)
+# ============================================================
+
+class ProcedureStateAttemptRow(Base):
+    """One recorded :class:`support.procedure_state.StepAttempt`.
+
+    Append-only: rows are only ever inserted (or replaced wholesale as a set
+    by :class:`support.procedure_state_service.ProcedureStateService`); the
+    ``sequence`` mirrors ``StepAttempt.sequence`` (0-based position within
+    the state's attempt log, for ordering only).
+    """
+
+    __tablename__ = "procedure_state_attempts"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        Identity(),
+        primary_key=True,
+        autoincrement=True,
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        Text,
+        ForeignKey("procedure_states.conversation_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    step_id: Mapped[str] = mapped_column(Text, nullable=False)
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('failed','succeeded','skipped','done_unknown')",
+            name="ck_procedure_state_attempts_outcome",
+        ),
+        UniqueConstraint(
+            "conversation_id",
+            "sequence",
+            name="uq_procedure_state_attempts_seq",
+        ),
+        Index(
+            "ix_procedure_state_attempts_conversation",
+            "conversation_id",
+            "sequence",
+        ),
     )

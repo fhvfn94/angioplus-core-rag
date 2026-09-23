@@ -9,8 +9,9 @@ They are SKIPPED unless you explicitly pass ``--run-cloud``:
 
 The provider talks DIRECTLY to the canonical Alice boundary over the
 Responses API -- it builds its own client and constructs the model id
-inline:
-    model = gpt://<YANDEX_FOLDER_ID>/aliceai-llm/latest
+inline. Validation now runs on the cheaper, currently supported
+Alice AI LLM **Flash**:
+    model = gpt://<YANDEX_FOLDER_ID>/aliceai-llm-flash/latest
     client.responses.create(..., text={"format": {json_schema}})
 
 It deliberately imports NO legacy support module: neither
@@ -120,13 +121,17 @@ def _procedure():
 # environment + the documented Yandex Cloud endpoint, so this test does NOT
 # import yandex.chat.alice_support_agent or yandex.chat.server.
 _ALICE_BASE_URL = "https://ai.api.cloud.yandex.net/v1"
-_ALICE_MODEL_TEMPLATE = "gpt://{folder_id}/aliceai-llm/latest"
+# Validation runs on Alice AI LLM Flash (cheaper tier). The identifier was
+# confirmed against the live AI Studio models endpoint
+# (GET https://ai.api.cloud.yandex.net/v1/models) for this folder on
+# 2026-06: gpt://<folder>/aliceai-llm-flash/latest.
+_ALICE_MODEL_TEMPLATE = "gpt://{folder_id}/aliceai-llm-flash/latest"
 # Mirrors the production semantic stage's output budget.
 _ALICE_MAX_OUTPUT_TOKENS = 1000
 
 
 def _alice_model_id(folder_id: str) -> str:
-    """The canonical Alice support model id: gpt://<folder>/aliceai-llm/latest."""
+    """The Alice Flash support model id: gpt://<folder>/aliceai-llm-flash/latest."""
     return _ALICE_MODEL_TEMPLATE.format(folder_id=folder_id)
 
 
@@ -188,13 +193,13 @@ def _real_provider(prompt: str, history):
 
     The client and model id are built INLINE here from the public Yandex
     Cloud endpoint and ``YANDEX_FOLDER_ID`` (composed as
-    ``gpt://<folder>/aliceai-llm/latest``). No legacy support module is
+    ``gpt://<folder>/aliceai-llm-flash/latest``). No legacy support module is
     imported -- this test must not depend on
     ``yandex/chat/alice_support_agent.py`` or ``yandex/chat/server.py``.
 
         client = OpenAI(api_key=..., base_url=<yandex v1>, project=folder)
         client.responses.create(
-            model="gpt://<folder>/aliceai-llm/latest",
+            model="gpt://<folder>/aliceai-llm-flash/latest",
             instructions=...,
             input=[{"role": "user", "content": prompt}],
             text={"format": {"type": "json_schema", "name": ..., "strict": True,
@@ -507,7 +512,7 @@ def test_cloud_provider_imports_no_legacy_pipeline():
 
 
 def test_cloud_model_id_is_canonical():
-    """The model id is the canonical Alice boundary form."""
+    """The model id is the canonical Alice Flash boundary form."""
     assert _alice_model_id("my-folder") == (
-        "gpt://my-folder/aliceai-llm/latest"
+        "gpt://my-folder/aliceai-llm-flash/latest"
     )

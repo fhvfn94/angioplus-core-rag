@@ -225,7 +225,7 @@ class InboundEvent(Base):
     __table_args__ = (
         CheckConstraint(
             "outcome IN "
-            "('received','answered','escalated','rejected','duplicate')",
+            "('received','answered','escalated','rejected','duplicate','forwarded')",
             name="ck_inbound_events_outcome",
         ),
         Index("ix_inbound_events_conversation", "conversation_id"),

@@ -19,7 +19,7 @@ from support.session_service import SessionService
 from support.state_service import SupportStateService
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.db]
 
 
 async def _make_conversation(session, channel="telegram", uid="u1", cid="chat1"):

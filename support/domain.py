@@ -239,6 +239,26 @@ class InvalidTransition(Exception):
         )
 
 
+class CaseAlreadyAttached(Exception):
+    """Raised when attaching a Tracker case to a conversation that already
+    points at a DIFFERENT case.
+
+    The conversation -> case pointer is immutable once set: re-pointing it
+    would silently orphan the operator thread that already owns the previous
+    case. ``attach_case`` therefore refuses the overwrite and this error
+    carries BOTH identity values so the caller (the /case handler) can return
+    a precise 409 without re-querying.
+    """
+
+    def __init__(self, conversation_id: str, existing_case_id: str) -> None:
+        self.conversation_id = conversation_id
+        self.existing_case_id = existing_case_id
+        super().__init__(
+            f"Conversation {conversation_id!r} already attached to case "
+            f"{existing_case_id!r}"
+        )
+
+
 # ============================================================
 # PURE FSM FUNCTIONS
 # ============================================================

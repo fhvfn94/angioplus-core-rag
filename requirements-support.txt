@@ -3,3 +3,5 @@ SQLAlchemy>=2.0,<3
 asyncpg>=0.29,<1
 alembic>=1.13,<2
 pydantic-settings>=2.2,<3
+# Declarative Support Procedure (YAML) infrastructure — Slice 1
+PyYAML>=6.0,<7

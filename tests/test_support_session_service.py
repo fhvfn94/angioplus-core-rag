@@ -10,7 +10,7 @@ from support.models import Conversation
 from support.session_service import SessionService
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.db]
 
 
 async def test_create_and_get_active(session):

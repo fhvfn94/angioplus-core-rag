@@ -57,6 +57,25 @@ class MessageService:
         )
         return list(result.scalars().all())
 
+    async def list_recent_for_conversation(
+        self,
+        conversation_id: str,
+        limit: int = 10,
+    ) -> list[Message]:
+        if limit <= 0:
+            return []
+
+        result = await self._session.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(limit)
+        )
+
+        rows = list(result.scalars().all())
+        rows.reverse()
+        return rows
+    
     async def build_transcript(self, conversation_id: str) -> str:
         """
         Build a human-readable transcript.

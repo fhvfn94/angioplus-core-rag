@@ -16,9 +16,13 @@ from support.session_service import SessionService
 from support.domain import MessageRole
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.db]
 
 
+@pytest.mark.filterwarnings(
+    "ignore::pytest.PytestWarning:"
+    "tests.test_support_idempotency"
+)
 def test_key_builders():
     assert telegram_event_id(123) == "tg:123"
     assert web_event_id("abc") == "web:abc"

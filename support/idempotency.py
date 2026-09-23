@@ -119,6 +119,14 @@ class IdempotencyService:
                 case_action=row.case_action,
                 conversation_id=row.conversation_id,
             )
+        elif row.conversation_id is not None:
+            prior = ProcessedTurnResult(
+                answer=None,
+                decision=row.decision,
+                reason=row.reason,
+                case_action=row.case_action,
+                conversation_id=row.conversation_id,
+            )
 
         return ClaimResult(claimed=False, outcome=row.outcome, prior=prior)
 

@@ -73,7 +73,14 @@ class RetrievalController:
         result: SearchResult,
         rank: int,
     ) -> EvidenceChunk:
-        source = _extract_metadata_value(
+        # 5D: the source identity lives in the dedicated ``filename`` field
+        # that the Vector Store API ALWAYS returns. The chunk text is the raw
+        # document body and -- as audited against the live store -- carries no
+        # in-text "Документ:" marker, so reading the source from the text alone
+        # collapsed ``source`` to None and ``source_type`` to "unknown".
+        # The in-text marker is kept ONLY as a fallback for stores that still
+        # embed it (then a blank/absent filename must not shadow it).
+        source = (result.filename or "").strip() or _extract_metadata_value(
             result.text,
             "Документ",
         )

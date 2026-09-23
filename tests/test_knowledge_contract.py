@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Contract tests for support.knowledge (Slice 5A -- PURE: no I/O, no network).
 
-This file pins the approved 5A contract only:
+This file pins the approved 5A + 5B contract:
 
   * ``KnowledgeStatus`` is a closed three-value enum;
   * ``KnowledgeResult`` enforces its FOUND / NOT_FOUND / ERROR invariants;
@@ -13,10 +13,14 @@ This file pins the approved 5A contract only:
   * the contract objects are immutable;
   * anti-regression guards: no routing/workflow vocabulary, no forbidden
     imports, no network/provider dependency, and no wiring into
-    ``support/__init__.py``.
+    ``support/__init__.py``;
+  * 5B entry points: ``retrieve_for_step`` uses ``ProcedureStep.evidence_query``
+    as the authoritative base and may only APPEND a refinement, while
+    ``retrieve_general`` normalizes a factual question; both reuse the same
+    ``_retrieve`` core, so FOUND/NOT_FOUND/ERROR semantics are untouched.
 
-Query construction, source priority and the Yandex backend are LATER
-checkpoints (5B/5C) and are deliberately NOT covered here.
+Source priority (IFU / authority) and the Yandex backend are LATER
+checkpoints (5C/5D) and are deliberately NOT covered here.
 """
 
 from __future__ import annotations
@@ -33,6 +37,15 @@ from support.knowledge import (
     KnowledgeResult,
     KnowledgeStatus,
 )
+from support.procedure import ProcedureStep, load_procedure
+
+
+BLACK_SCREEN = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "procedures"
+    / "black_screen.yaml"
+)
 
 
 # ----------------------------------------------------------------
@@ -41,6 +54,19 @@ from support.knowledge import (
 
 def item(text="evidence text", **kw) -> KnowledgeItem:
     return KnowledgeItem(text=text, **kw)
+
+
+def step(
+    step_id="STEP_A",
+    evidence_query="test query A",
+    action="Generic test action.",
+) -> ProcedureStep:
+    return ProcedureStep(
+        id=step_id,
+        action=action,
+        evidence_query=evidence_query,
+        transitions={"attempted_failed": "ESCALATE", "resolved": "RESOLVED"},
+    )
 
 
 class FakeBackend:
@@ -321,10 +347,21 @@ def test_no_forbidden_imports():
             )
 
 
-def test_only_stdlib_imports():
-    allowed = {"__future__", "dataclasses", "enum", "typing"}
+def test_only_allowed_imports():
+    allowed = {"__future__", "dataclasses", "enum", "typing", "support"}
     roots = {name.split(".")[0] for name in _module_imports()}
     assert roots <= allowed, f"unexpected imports: {roots - allowed}"
+
+
+def test_only_support_procedure_is_imported():
+    # 5B may import the declarative ProcedureStep type -- and nothing else from
+    # the support package (no router / procedure state / analyzer).
+    support_mods = {
+        n
+        for n in _module_imports()
+        if n == "support" or n.startswith("support.")
+    }
+    assert support_mods == {"support.procedure"}
 
 
 def test_no_routing_or_workflow_vocabulary():
@@ -355,4 +392,198 @@ def test_public_api_surface():
         "KnowledgeItem",
         "KnowledgeResult",
         "KnowledgeBackend",
+        "retrieve_for_step",
+        "retrieve_general",
     }
+
+
+# ================================================================
+# 6. PROCEDURE-BOUND RETRIEVAL (5B)
+# ================================================================
+
+def test_step_evidence_query_is_the_retrieval_base():
+    backend = FakeBackend(items=[item("evidence")])
+    result = kb.retrieve_for_step(
+        step(evidence_query="test query A"), backend=backend
+    )
+    assert result.status is KnowledgeStatus.FOUND
+    assert backend.calls == [("test query A", kb.DEFAULT_MAX_RESULTS)]
+    assert result.query == "test query A"
+
+
+def test_step_query_is_normalized():
+    backend = FakeBackend(items=[item("evidence")])
+    result = kb.retrieve_for_step(
+        step(evidence_query="  test   query   A  "), backend=backend
+    )
+    assert backend.calls[0][0] == "test query A"
+    assert result.query == "test query A"
+
+
+def test_refinement_is_appended_never_substituted():
+    backend = FakeBackend(items=[item("evidence")])
+    result = kb.retrieve_for_step(
+        step(evidence_query="base objective"),
+        refinement="usb-c only",
+        backend=backend,
+    )
+    assert backend.calls[0][0] == "base objective usb-c only"
+    assert result.query.startswith("base objective")
+
+
+def test_refinement_is_normalized_before_appending():
+    backend = FakeBackend(items=[item("evidence")])
+    kb.retrieve_for_step(
+        step(evidence_query="base"),
+        refinement="  usb   c  ",
+        backend=backend,
+    )
+    assert backend.calls[0][0] == "base usb c"
+
+
+@pytest.mark.parametrize("refinement", [None, "", "   ", "\n\t "])
+def test_blank_refinement_behaves_as_absent(refinement):
+    backend = FakeBackend(items=[item("evidence")])
+    kb.retrieve_for_step(
+        step(evidence_query="base"), refinement=refinement, backend=backend
+    )
+    assert backend.calls[0][0] == "base"
+
+
+@pytest.mark.parametrize("missing", [None, "", "   ", "\n"])
+def test_missing_or_blank_evidence_query_is_not_found_without_backend_call(
+    missing,
+):
+    backend = FakeBackend(items=[item("evidence")])
+    result = kb.retrieve_for_step(
+        step(evidence_query=missing), backend=backend
+    )
+    assert result.status is KnowledgeStatus.NOT_FOUND
+    assert result.items == ()
+    assert backend.calls == []
+
+
+def test_no_fallback_to_step_action():
+    backend = FakeBackend(items=[item("evidence")])
+    s = ProcedureStep(
+        id="STEP_A",
+        action="Confirm the power LED is lit.",
+        evidence_query=None,
+        transitions={"attempted_failed": "ESCALATE", "resolved": "RESOLVED"},
+    )
+    result = kb.retrieve_for_step(s, backend=backend)
+    assert result.status is KnowledgeStatus.NOT_FOUND
+    assert backend.calls == []
+    assert "power" not in result.query.lower()
+
+
+def test_requested_step_is_used_and_not_mutated():
+    s = step(step_id="CHECK_CABLE", evidence_query="angioplus display cable")
+    backend = FakeBackend(items=[item("evidence")])
+    result = kb.retrieve_for_step(s, backend=backend)
+    assert backend.calls[0][0] == "angioplus display cable"
+    assert result.query == "angioplus display cable"
+    # the caller's step object is untouched
+    assert s.evidence_query == "angioplus display cable"
+    assert s.id == "CHECK_CABLE"
+
+
+def test_step_retrieval_uses_real_procedure_fixture():
+    procedure = load_procedure(BLACK_SCREEN)
+    backend = FakeBackend(items=[item("doc")])
+    result = kb.retrieve_for_step(
+        procedure.steps["CHECK_POWER"], backend=backend
+    )
+    assert result.status is KnowledgeStatus.FOUND
+    assert backend.calls == [
+        ("angioplus black screen power led", kb.DEFAULT_MAX_RESULTS)
+    ]
+
+
+def test_step_retrieval_maps_through_core_semantics():
+    empty = kb.retrieve_for_step(step(), backend=FakeBackend(items=[]))
+    assert empty.status is KnowledgeStatus.NOT_FOUND
+    failed = kb.retrieve_for_step(
+        step(), backend=FakeBackend(exc=RuntimeError("x"))
+    )
+    assert failed.status is KnowledgeStatus.ERROR
+    assert failed.items == ()
+
+
+def test_step_retrieval_max_num_results_passthrough():
+    backend = FakeBackend(items=[item("evidence")])
+    kb.retrieve_for_step(step(), backend=backend, max_num_results=2)
+    assert backend.calls == [("test query A", 2)]
+
+
+# ================================================================
+# 7. GENERAL KNOWLEDGE (5B)
+# ================================================================
+
+def test_general_question_is_normalized_and_sent_to_same_backend():
+    backend = FakeBackend(items=[item("evidence")])
+    result = kb.retrieve_general(
+        "  What   are the system requirements?  ", backend=backend
+    )
+    assert result.status is KnowledgeStatus.FOUND
+    assert backend.calls == [
+        ("What are the system requirements?", kb.DEFAULT_MAX_RESULTS)
+    ]
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t "])
+def test_blank_general_question_is_not_found_without_backend_call(blank):
+    backend = FakeBackend(items=[item("evidence")])
+    result = kb.retrieve_general(blank, backend=backend)
+    assert result.status is KnowledgeStatus.NOT_FOUND
+    assert result.query == ""
+    assert backend.calls == []
+
+
+def test_general_semantics_identical_to_core():
+    assert (
+        kb.retrieve_general("q", backend=FakeBackend(items=[])).status
+        is KnowledgeStatus.NOT_FOUND
+    )
+    err = kb.retrieve_general("q", backend=FakeBackend(exc=ValueError("x")))
+    assert err.status is KnowledgeStatus.ERROR
+    assert err.items == ()
+    assert err.error is not None
+
+
+def test_general_does_not_require_a_procedure():
+    # No ProcedureStep / Procedure involved at all.
+    backend = FakeBackend(items=[item("spec")])
+    result = kb.retrieve_general(
+        "device connection instructions", backend=backend
+    )
+    assert result.status is KnowledgeStatus.FOUND
+    assert backend.calls == [
+        ("device connection instructions", kb.DEFAULT_MAX_RESULTS)
+    ]
+
+
+# ================================================================
+# 8. RUNTIME ISOLATION GUARD (5B)
+# ================================================================
+
+_RUNTIME_MODULES = (
+    Path("yandex/chat/server.py"),
+    Path("yandex/chat/alice_support_agent.py"),
+    Path("yandex/realtime/web/server.py"),
+)
+
+
+def test_production_runtime_does_not_import_knowledge():
+    """Static scan only (never imports these modules): the Knowledge layer
+    must not be wired into any production runtime path yet."""
+    root = Path(kb.__file__).resolve().parents[1]
+    for rel in _RUNTIME_MODULES:
+        path = root / rel
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        assert "support.knowledge" not in text, f"{rel} imports support.knowledge"
+        assert (
+            "from support import knowledge" not in text
+        ), f"{rel} imports support.knowledge"

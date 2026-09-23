@@ -1,0 +1,20 @@
+procedure_id: BLACK_SCREEN
+version: 1
+issue: "black screen"
+entry_step: CHECK_POWER
+steps:
+  - id: CHECK_POWER
+    action: "Confirm the device is powered on and the power LED is lit."
+    evidence_query: "angioplus black screen power led"
+    transitions:
+      attempted_failed: CHECK_CABLE
+      resolved: RESOLVED
+  - id: CHECK_CABLE
+    action: "Reseat the display cable on both ends."
+    evidence_query: "angioplus black screen display cable"
+    transitions:
+      attempted_failed: ESCALATE
+      resolved: RESOLVED
+terminators:
+  - ESCALATE
+  - RESOLVED

@@ -1,0 +1,19 @@
+procedure_id: TEST_PROCEDURE
+version: 1
+issue: "synthetic test issue"
+entry_step: STEP_A
+steps:
+  - id: STEP_A
+    action: "Generic test action for STEP_A."
+    evidence_query: "test query A"
+    transitions:
+      attempted_failed: STEP_B
+      resolved: RESOLVED
+  - id: STEP_B
+    action: "Generic test action for STEP_B."
+    transitions:
+      attempted_failed: ESCALATE
+      resolved: RESOLVED
+terminators:
+  - ESCALATE
+  - RESOLVED

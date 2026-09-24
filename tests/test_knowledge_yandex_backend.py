@@ -368,21 +368,28 @@ def test_public_api_surface():
     assert set(kyb.__all__) == {"YandexKnowledgeBackend"}
 
 
-_RUNTIME_MODULES = (
-    Path("yandex/chat/server.py"),
-    Path("yandex/chat/alice_support_agent.py"),
-    Path("yandex/realtime/web/server.py"),
-)
+# The ONE sanctioned production composition root allowed to reference /
+# construct the 5C adapter. It is composition-only and is itself NOT wired
+# into any runtime path. Every OTHER support / runtime module must still not
+# reference the adapter (mirrors the single-root guards in
+# tests/test_alice_analyzer_yandex.py and tests/test_response_generator_yandex.py).
+_COMPOSITION_ROOT = Path("support/support_core.py")
 
 
 def test_not_wired_into_any_production_runtime():
-    root = _module_path().resolve().parents[1]
-    for rel in _RUNTIME_MODULES:
-        path = root / rel
-        if not path.exists():
-            continue
-        text = path.read_text(encoding="utf-8")
-        assert "knowledge_yandex" not in text, f"{rel} wires the 5C adapter"
-        assert "YandexKnowledgeBackend" not in text, (
-            f"{rel} wires the 5C adapter"
-        )
+    adapter_path = _module_path().resolve()
+    root = adapter_path.parents[1]
+    composition_root = (root / _COMPOSITION_ROOT).resolve()
+
+    scanned = 0
+    for pattern in ("support/**/*.py", "yandex/**/*.py", "*.py"):
+        for path in root.glob(pattern):
+            if path.resolve() in (adapter_path, composition_root):
+                continue
+            if "tests" in path.parts or "__pycache__" in path.parts:
+                continue
+            scanned += 1
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            assert "knowledge_yandex" not in text, path
+            assert "YandexKnowledgeBackend" not in text, path
+    assert scanned > 0

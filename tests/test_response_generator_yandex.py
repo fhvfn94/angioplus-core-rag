@@ -711,14 +711,24 @@ def test_public_api_surface():
     }
 
 
+# Slice 11A.3a: ``support/support_core.py`` is the ONE sanctioned production
+# COMPOSITION root -- the single module allowed to reference this adapter and
+# construct it. Every OTHER support / runtime module must still not reference
+# it (it is still not wired into any runtime path).
+_COMPOSITION_ROOT = Path("support/support_core.py")
+
+
 def test_not_wired_into_any_production_runtime_path():
     adapter_path = Path(ry.__file__).resolve()
     root = adapter_path.parents[1]
+    composition_root = (root / _COMPOSITION_ROOT).resolve()
 
     scanned = 0
     for pattern in ("support/**/*.py", "yandex/**/*.py", "*.py"):
         for path in root.glob(pattern):
-            if path.resolve() == adapter_path or "__pycache__" in path.parts:
+            if path.resolve() in (adapter_path, composition_root):
+                continue
+            if "__pycache__" in path.parts:
                 continue
             scanned += 1
             text = path.read_text(encoding="utf-8", errors="ignore")

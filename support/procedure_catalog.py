@@ -147,18 +147,23 @@ class ProcedureCatalog:
         if procedures is None:
             raise ValueError("procedures must be a sequence of Procedure.")
         indexed: list[tuple[Procedure, frozenset[str]]] = []
-        seen: set[str] = set()
+        # Identity is the PAIR (procedure_id, version): one procedure_id may
+        # therefore carry several versions. Only an EXACT duplicate identity
+        # is rejected -- there is no per-id collapse and no implicit
+        # "keep the latest version" behaviour.
+        seen: set[tuple[str, int]] = set()
         for procedure in procedures:
             if not isinstance(procedure, Procedure):
                 raise TypeError(
                     "catalog entries must be Procedure instances, got "
                     f"{type(procedure).__name__}."
                 )
-            if procedure.procedure_id in seen:
+            identity = (procedure.procedure_id, procedure.version)
+            if identity in seen:
                 raise ValueError(
-                    f"duplicate procedure_id {procedure.procedure_id!r}."
+                    f"duplicate procedure identity {identity!r}."
                 )
-            seen.add(procedure.procedure_id)
+            seen.add(identity)
             indexed.append((procedure, _issue_tokens(procedure.issue)))
         # No ordering is imposed: the selection decision never ranks or
         # tie-breaks on procedure_id (or on anything else).
@@ -264,6 +269,38 @@ class ProcedureCatalog:
         replace that mechanism without changing this boundary.
         """
         return self.issue_match(text)
+
+    # ---------------------------------------------------------
+    # IDENTITY-BASED REHYDRATION (Slice 11A.1)
+    # ---------------------------------------------------------
+
+    def get(self, procedure_id: str, version: int) -> Optional[Procedure]:
+        """EXACT identity -> the already-validated Procedure, or ``None``.
+
+        Identity-based rehydration ONLY, deliberately NOT a second entry
+        point for cold-start selection:
+
+          * BOTH ``procedure_id`` and ``version`` are REQUIRED;
+          * the match is EXACT on the pair ``(procedure_id, version)`` --
+            no case-folding, no whitespace trimming, no lexical matching;
+          * an unknown ``procedure_id`` yields ``None``;
+          * a wrong / unknown version yields ``None`` with NO fallback:
+            never the "latest" version, never an implicit upgrade, never
+            another version of the same procedure;
+          * the returned object is the very same validated
+            :class:`~support.procedure.Procedure` instance the catalog
+            holds -- no re-parse, no LLM / analyzer involvement.
+
+        Cold-start selection remains exclusively :meth:`select`; this
+        method never maps text to an identity.
+        """
+        for procedure, _ in self._entries:
+            if (
+                procedure.procedure_id == procedure_id
+                and procedure.version == version
+            ):
+                return procedure
+        return None
 
 
 __all__ = [

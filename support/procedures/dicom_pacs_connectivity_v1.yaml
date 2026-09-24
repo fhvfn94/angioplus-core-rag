@@ -1,0 +1,67 @@
+# ============================================================
+# ProcedureCatalog production procedure -- DICOM / PACS connectivity (v1)
+# ------------------------------------------------------------
+# COLD-START SELECTION MODEL = "mvp_lexical_bootstrap"   (TEMPORARY)
+#
+#   This file is loaded by support.procedure_catalog.ProcedureCatalog.
+#   `catalog.issue_match` is a TEMPORARY lexical bootstrap, NOT the
+#   long-term semantic routing architecture. ProcedureCatalog is the ONLY
+#   component allowed to map a cold-start signal to procedure_id /
+#   procedure_version. The LLM must NEVER output or select procedure_id.
+#
+# PROVENANCE (authoring source = the AngioPlus Core v2.5 IFU, RU):
+#
+#   * §12.3.4 "PACS" (pp. 18-20):
+#       - open DICOM Connect on the PStation toolbar and set the AE title
+#         and port number (defaults: "μFR" and port "1108");
+#       - register the PStation storage SCP, with the AE title and the
+#         PACS port number, as a DICOM destination node (required to set
+#         up the connection);
+#       - add a DICOM node and test the newly registered DICOM node.
+#   * §20 "Поиск и устранение неисправностей" (p. 44):
+#       - if the screen shows an error / crash / other problem, restart
+#         the software.
+#
+#   Deliberately NOT used:
+#     - the external-contact clause ("...контакт с Shanghai Pulse Medical
+#       Technology, Inc.") -- it is a directive to an external entity and
+#       is expressed as the declarative ESCALATE terminator instead, so it
+#       can never be rendered as a step action
+#       (support.response_generator._is_external_contact_directive);
+#     - the "IP-адрес удаленного узла" field and the §8 OS-port/firewall
+#       advice -- OS/IT-level and out of this procedure's scope;
+#     - the "Q&A List ENG.xlsx" -- it is a binary XLSX with no extracted
+#       text and could not be parsed; it is therefore never cited.
+# ============================================================
+procedure_id: DICOM_PACS_CONNECTIVITY
+version: 1
+issue: "Подключение и передача данных DICOM на PACS: настройка и проверка соединения."
+entry_step: CONFIGURE_DICOM_CONNECT
+steps:
+  - id: CONFIGURE_DICOM_CONNECT
+    action: "Откройте DICOM Connect на панели инструментов PStation и укажите заголовок AE и номер порта (по умолчанию: μFR и порт 1108)."
+    evidence_query: "dicom connect pstation панель инструментов заголовок ae номера порта 1108"
+    transitions:
+      attempted_failed: REGISTER_DESTINATION_NODE
+      resolved: RESOLVED
+  - id: REGISTER_DESTINATION_NODE
+    action: "Зарегистрируйте сервер PStation для хранения SCP с заголовком AE и номером порта в PACS в качестве узла назначения DICOM."
+    evidence_query: "зарегистрировать сервер pstation хранения scp заголовок ae номера порта pacs узел назначения dicom"
+    transitions:
+      attempted_failed: TEST_DICOM_NODE
+      resolved: RESOLVED
+  - id: TEST_DICOM_NODE
+    action: "Добавьте узел DICOM и нажмите кнопку тестирования зарегистрированного узла DICOM, чтобы проверить соединение."
+    evidence_query: "добавить узел dicom тестирования зарегистрированного узла соединение"
+    transitions:
+      attempted_failed: RESTART_SOFTWARE
+      resolved: RESOLVED
+  - id: RESTART_SOFTWARE
+    action: "Перезапустите программное обеспечение AngioPlus Core и повторите проверку соединения."
+    evidence_query: "перезапустите программное обеспечение angioplus core проверка соединения"
+    transitions:
+      attempted_failed: ESCALATE
+      resolved: RESOLVED
+terminators:
+  - ESCALATE
+  - RESOLVED

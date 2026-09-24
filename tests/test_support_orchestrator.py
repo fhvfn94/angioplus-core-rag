@@ -10,7 +10,9 @@ only the three INJECTED ports are faked:
   * ``response_provider`` -- returns explanation JSON (or raises).
 
 Plus AST/structural guards that pin the Orchestrator's boundaries (no routing
-policy, no fabricated fallbacks, no frozen-slice edits, no production wiring).
+policy, no fabricated fallbacks, no frozen-slice edits). Wiring is allowed
+from exactly ONE sanctioned production module -- the Slice 9 application
+boundary ``support/turn_executor.py`` -- and nowhere else.
 """
 
 from __future__ import annotations
@@ -813,14 +815,19 @@ _SKIP_DIRS = {
     ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "dist",
 }
 
+# The Slice 9 application boundary is the ONE sanctioned production module that
+# composes the orchestrator with persistence. Every OTHER production module
+# (transports, server, workflows) must still not import the orchestrator.
+_ORCHESTRATOR_WIRING_POINT = "turn_executor.py"
 
-def test_no_production_runtime_imports_orchestrator_yet():
+
+def test_only_turn_executor_imports_orchestrator():
     repo_root = Path(__file__).resolve().parents[1]
     offenders = []
     for path in repo_root.rglob("*.py"):
         if any(part in _SKIP_DIRS for part in path.parts):
             continue
-        if path.name == "orchestrator.py":
+        if path.name in {"orchestrator.py", _ORCHESTRATOR_WIRING_POINT}:
             continue
         if "tests" in path.parts:
             continue
@@ -828,3 +835,15 @@ def test_no_production_runtime_imports_orchestrator_yet():
         if "support.orchestrator" in text or "from support import orchestrator" in text:
             offenders.append(str(path))
     assert offenders == []
+
+
+def test_sanctioned_wiring_point_is_pinned():
+    # Guard the guard: the exempted module must exist and really import the
+    # orchestrator, so the exemption can never silently widen.
+    wiring = (
+        Path(__file__).resolve().parents[1]
+        / "support"
+        / _ORCHESTRATOR_WIRING_POINT
+    )
+    assert wiring.exists()
+    assert "support.orchestrator" in wiring.read_text(encoding="utf-8")

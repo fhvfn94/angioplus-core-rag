@@ -307,6 +307,19 @@ class ProcedureStateRow(Base):
         Integer, nullable=False, server_default=text("1")
     )
 
+    # --- persistence concurrency (Slice 9) ---
+    # Monotonic per-conversation write revision for OPTIMISTIC concurrency
+    # control (compare-and-swap), owned by
+    # :class:`support.procedure_state_store.ProcedureStateStore`. The FIRST
+    # persisted state has revision 1 (the server default keeps the frozen
+    # ProcedureStateService -- which never sets it -- on the same semantic
+    # model); every successful CAS write sets
+    # ``revision = expected_revision + 1``. This is a persistence concern and
+    # is deliberately NOT part of the frozen ``ProcedureState`` value object.
+    revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -325,6 +338,10 @@ class ProcedureStateRow(Base):
         CheckConstraint(
             "schema_version >= 1",
             name="ck_procedure_states_schema_version",
+        ),
+        CheckConstraint(
+            "revision >= 1",
+            name="ck_procedure_states_revision",
         ),
     )
 

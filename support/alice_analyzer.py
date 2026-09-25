@@ -68,6 +68,7 @@ from support.observation import (
     ObservationScope,
     ProblemStatus,
     ReportedAction,
+    RequestKind,
     SemanticObservation,
     StepOutcome,
 )
@@ -105,6 +106,7 @@ _TOP_LEVEL_FIELDS = (
     "human_requested",
     "clarification_facts",
     "new_issue",
+    "request_kind",
 )
 
 # Per-action keys -- exactly these, no more.
@@ -113,6 +115,7 @@ _ACTION_FIELDS = ("step_id", "outcome")
 _SCOPE_VALUES = {s.value for s in ObservationScope}
 _PROBLEM_VALUES = {p.value for p in ProblemStatus}
 _OUTCOME_VALUES = {o.value for o in StepOutcome}
+_REQUEST_KIND_VALUES = {k.value for k in RequestKind}
 
 
 # ============================================================
@@ -134,6 +137,7 @@ def _fail_safe_observation() -> SemanticObservation:
         human_requested=False,
         clarification_facts=(),
         new_issue=None,
+        request_kind=RequestKind.UNCLEAR,
     )
 
 
@@ -175,6 +179,11 @@ _SYSTEM_RULES = """\
 ЗАПРЕЩЕНО: выбирать ANSWER / CLARIFY / ESCALATE, решать о передаче
 специалисту, управлять маршрутизацией или конечным автоматом. Возвращай
 только семантические факты в строгом JSON.
+
+request_kind — это ФАКТ о сообщении, а НЕ решение о маршрутизации.
+НИКОГДА не используй request_kind, чтобы закодировать: выбор процедуры,
+передачу специалисту, возможность системы ответить, наличие знаний или
+необходимость поиска.
 
 ПРО ССЫЛКИ В КОНТЕКСТЕ:
 Если пользователь говорит «не помогло», «я это уже делал», «сделал это»
@@ -227,6 +236,22 @@ step_id = null для него.
   new_issue: строковый НОВЫЙ проблемы или null. Заполняй ТОЛЬКО когда
     пользователь поднимает ДРУГУЮ проблему. Продолжение той же проблемы
     (например, повторный повтор или «не помогло») — это НЕ new_issue.
+
+  request_kind: "problem" | "information" | "unclear"
+    - "problem": пользователь сообщает о симптоме, неисправности, сбое,
+      проблеме подключения/настройки, неожиданном поведении ИЛИ просит
+      помочь устранить/настроить/подключить что-либо.
+    - "information": пользователь просит фактическую/справочную
+      информацию о продукте или документации и НЕ сообщает о текущей
+      проблеме, которую нужно устранять.
+    - "unclear": безопасно определить нельзя.
+    Примеры: «Какие версии Windows поддерживает AngioPlus?» -> "information";
+      «AngioPlus не запускается на Windows 11» -> "problem";
+      «PACS не подключается» -> "problem"; «Что такое PACS?» -> "information";
+      «Не работает» -> "problem";
+      «Как подключить AngioPlus к PACS?» -> "problem" (просьба настроить).
+    НИКОГДА не выбирай "information" только потому, что problem_status
+    не указан.
 
 Отвечай РОВНО одним JSON-объектом указанной формы, без markdown.
 """
@@ -369,6 +394,12 @@ def _parse_problem_status(raw: Any) -> Optional[ProblemStatus]:
     return ProblemStatus(raw)
 
 
+def _parse_request_kind(raw: Any) -> RequestKind:
+    if not isinstance(raw, str) or raw not in _REQUEST_KIND_VALUES:
+        raise _Reject(f"request_kind: invalid value {raw!r}")
+    return RequestKind(raw)
+
+
 def _parse_bool(raw: Any, *, where: str) -> bool:
     # bool is a subclass of int; require the real bool.
     if not isinstance(raw, bool):
@@ -432,6 +463,7 @@ def parse_semantic_output(
         )
         facts = _parse_facts(data["clarification_facts"])
         new_issue = _parse_new_issue(data["new_issue"])
+        request_kind = _parse_request_kind(data["request_kind"])
     except _Reject:
         return _fail_safe_observation()
 
@@ -442,6 +474,7 @@ def parse_semantic_output(
         human_requested=human_requested,
         clarification_facts=facts,
         new_issue=new_issue,
+        request_kind=request_kind,
     )
 
 

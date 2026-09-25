@@ -13,6 +13,8 @@ An observation describes FACTS ONLY:
   * whether the user explicitly asked for a human
   * free-form clarification facts
   * an optionally reported new issue
+  * whether the message is primarily a problem report or an information
+    request (request_kind)
 
 It is ROUTING-FREE: it carries no candidate action, no ANSWER/CLARIFY/
 ESCALATE decision, and no verdict on "already attempted". Turning facts
@@ -63,6 +65,21 @@ class StepOutcome(_StrEnum):
     SUCCEEDED = "succeeded"        # user did it and it fixed the problem
     SKIPPED = "skipped"            # user says already done / cannot do / N/A
     DONE_UNKNOWN = "done_unknown"  # user did it, result not yet clear
+
+
+class RequestKind(_StrEnum):
+    """Semantic reading of WHAT the message is doing (a fact, not a decision).
+
+    This is a SEMANTIC INTERPRETATION ONLY. It must NEVER be used to encode a
+    routing/engine choice: it does not select a procedure, does not decide
+    whether to escalate, does not decide whether the system can answer, and
+    does not decide whether knowledge exists or retrieval should run. Turning
+    intent into a next action remains the Router's job (a later slice).
+    """
+
+    PROBLEM = "problem"          # reports a symptom / asks how to fix it
+    INFORMATION = "information"  # asks for a factual/product/documentation fact
+    UNCLEAR = "unclear"          # cannot be safely determined
 
 
 @dataclass(frozen=True)
@@ -118,11 +135,20 @@ class SemanticObservation:
     # Router / orchestrator decision.
     new_issue: Optional[str]
 
+    # Is the message primarily reporting/seeking help with a problem, asking
+    # for a factual/product/documentation fact, or semantically unclear?
+    # A CLOSED SEMANTIC FACT -- NOT a routing decision. It never selects a
+    # procedure, never decides escalation, and never decides whether the
+    # system can answer. The family selector / Router own those choices in a
+    # later slice.
+    request_kind: RequestKind
+
 
 __all__ = [
     "ObservationScope",
     "ProblemStatus",
     "StepOutcome",
+    "RequestKind",
     "ReportedAction",
     "SemanticObservation",
 ]

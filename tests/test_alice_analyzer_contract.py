@@ -29,6 +29,7 @@ from support.observation import (
     ObservationScope,
     ProblemStatus,
     ReportedAction,
+    RequestKind,
     StepOutcome,
 )
 from support.procedure import load_procedure
@@ -66,6 +67,7 @@ def make_raw(
     human_requested=False,
     facts=(),
     new_issue=None,
+    request_kind="problem",
     **extra,
 ) -> str:
     payload = {
@@ -75,6 +77,7 @@ def make_raw(
         "human_requested": human_requested,
         "clarification_facts": list(facts),
         "new_issue": new_issue,
+        "request_kind": request_kind,
     }
     payload.update(extra)
     return json.dumps(payload)
@@ -117,6 +120,7 @@ def test_fail_safe_observation_shape():
     assert obs.human_requested is False
     assert obs.new_issue is None
     assert obs.clarification_facts == ()
+    assert obs.request_kind == RequestKind.UNCLEAR
     assert len(obs.reported_actions) == 1
     assert obs.reported_actions[0].step_id is None
     assert obs.reported_actions[0].outcome is None
@@ -290,6 +294,7 @@ def test_missing_field_rejected(allowed):
             "human_requested": False,
             "clarification_facts": [],
             "new_issue": None,
+            "request_kind": "problem",
         }
     )
     _assert_fail_safe(az.parse_semantic_output(raw, allowed_steps=allowed))
@@ -333,6 +338,73 @@ def test_invalid_problem_status_enum_rejected(allowed):
             make_raw(problem_status="maybe"), allowed_steps=allowed
         )
     )
+
+
+# ================================================================
+# 3b. request_kind -- the closed semantic FACT (Slice 11B.1b.1)
+# ================================================================
+
+def test_request_kind_problem_parses(allowed):
+    obs = az.parse_semantic_output(
+        make_raw(request_kind="problem"), allowed_steps=allowed
+    )
+    assert obs.request_kind == RequestKind.PROBLEM
+
+
+def test_request_kind_information_parses(allowed):
+    obs = az.parse_semantic_output(
+        make_raw(request_kind="information"), allowed_steps=allowed
+    )
+    assert obs.request_kind == RequestKind.INFORMATION
+
+
+def test_request_kind_unclear_parses(allowed):
+    obs = az.parse_semantic_output(
+        make_raw(request_kind="unclear"), allowed_steps=allowed
+    )
+    assert obs.request_kind == RequestKind.UNCLEAR
+
+
+def test_request_kind_missing_is_rejected(allowed):
+    raw = json.dumps(
+        {
+            "scope": "in_scope",
+            "reported_actions": [],
+            "problem_status": None,
+            "human_requested": False,
+            "clarification_facts": [],
+            "new_issue": None,
+            # request_kind missing
+        }
+    )
+    _assert_fail_safe(az.parse_semantic_output(raw, allowed_steps=allowed))
+
+
+def test_request_kind_unknown_value_is_rejected(allowed):
+    _assert_fail_safe(
+        az.parse_semantic_output(
+            make_raw(request_kind="question"), allowed_steps=allowed
+        )
+    )
+
+
+def test_request_kind_wrong_type_is_rejected(allowed):
+    _assert_fail_safe(
+        az.parse_semantic_output(
+            make_raw(request_kind=3), allowed_steps=allowed
+        )
+    )
+
+
+def test_request_kind_not_inferred_from_problem_status(allowed):
+    # A well-formed message with NO problem_status must still require an
+    # EXPLICIT request_kind -- the parser never implies INFORMATION.
+    obs = az.parse_semantic_output(
+        make_raw(problem_status=None, request_kind="information"),
+        allowed_steps=allowed,
+    )
+    assert obs.request_kind == RequestKind.INFORMATION
+    assert obs.problem_status is None
 
 
 def test_wrong_type_human_requested_rejected(allowed):
@@ -414,6 +486,7 @@ def test_analyze_provider_exception_is_fail_safe(procedure):
         provider=_provider_raising(RuntimeError("boom")),
     )
     _assert_fail_safe(obs)
+    assert obs.request_kind == RequestKind.UNCLEAR
 
 
 def test_analyze_no_procedure_is_fail_safe_on_invented_id():

@@ -44,7 +44,7 @@ LAZILY so this module -- and its unit tests -- import without the SDK and
 without credentials.
 
 The output is constrained with the strict JSON schema the Slice 4 parser
-accepts (exactly six top-level fields, no extras), so a well-behaved model
+accepts (exactly seven top-level fields, no extras), so a well-behaved model
 can only ever produce the shape the parser validates.
 """
 
@@ -97,7 +97,7 @@ def _semantic_format() -> Dict[str, Any]:
     This is the INNER ``format`` object of the Responses API ``text``
     config (``text={"format": {...}}``), i.e. the exact shape the other
     canonical Alice call sites in this repo use. The schema mirrors the
-    FROZEN Slice 4 output contract (the six top-level fields and the
+    FROZEN Slice 4 output contract (the seven top-level fields and the
     ``{step_id, outcome}`` action shape) so the model cannot drift from
     what :func:`support.alice_analyzer.parse_semantic_output` validates.
     Built per call so no shared mutable structure can leak between calls.
@@ -145,6 +145,10 @@ def _semantic_format() -> Dict[str, Any]:
                     "items": {"type": "string"},
                 },
                 "new_issue": {"type": ["string", "null"]},
+                "request_kind": {
+                    "type": "string",
+                    "enum": ["problem", "information", "unclear"],
+                },
             },
             "required": [
                 "scope",
@@ -153,6 +157,7 @@ def _semantic_format() -> Dict[str, Any]:
                 "human_requested",
                 "clarification_facts",
                 "new_issue",
+                "request_kind",
             ],
         },
     }

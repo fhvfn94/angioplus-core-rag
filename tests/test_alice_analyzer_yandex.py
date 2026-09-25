@@ -44,6 +44,7 @@ from support.observation import (
     ObservationScope,
     ProblemStatus,
     ReportedAction,
+    RequestKind,
     SemanticObservation,
     StepOutcome,
 )
@@ -102,6 +103,7 @@ def _json_observation(**overrides) -> str:
         "human_requested": False,
         "clarification_facts": [],
         "new_issue": None,
+        "request_kind": "problem",
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -271,7 +273,16 @@ def test_request_pins_the_strict_single_object_envelope():
         "human_requested",
         "clarification_facts",
         "new_issue",
+        "request_kind",
     }
+
+    # request_kind is REQUIRED and closed to exactly the three enum values.
+    request_kind = schema["properties"]["request_kind"]
+    assert request_kind["type"] == "string"
+    assert request_kind["enum"] == ["problem", "information", "unclear"]
+    assert "enum" in request_kind and len(request_kind["enum"]) == 3
+    assert "request_kind" in schema["required"]
+    assert set(schema["properties"]) == set(schema["required"])
 
 
 def test_raw_provider_text_is_returned_unchanged():
@@ -488,6 +499,7 @@ def test_transport_error_is_mapped_to_the_fail_safe_observation():
         human_requested=False,
         clarification_facts=(),
         new_issue=None,
+        request_kind=RequestKind.UNCLEAR,
     )
     assert len(client.responses.requests) == 1
 

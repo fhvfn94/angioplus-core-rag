@@ -15,6 +15,7 @@ from support.observation import (
     ObservationScope,
     ProblemStatus,
     ReportedAction,
+    RequestKind,
     SemanticObservation,
     StepOutcome,
 )
@@ -55,6 +56,17 @@ def test_step_outcome_members():
     }
 
 
+def test_request_kind_members_are_closed():
+    assert set(RequestKind) == {
+        RequestKind.PROBLEM,
+        RequestKind.INFORMATION,
+        RequestKind.UNCLEAR,
+    }
+    assert RequestKind.PROBLEM.value == "problem"
+    assert RequestKind.INFORMATION.value == "information"
+    assert RequestKind.UNCLEAR.value == "unclear"
+
+
 # ----------------------------------------------------------------
 # Value-object shape
 # ----------------------------------------------------------------
@@ -74,6 +86,7 @@ def test_semantic_observation_fields():
         "human_requested",
         "clarification_facts",
         "new_issue",
+        "request_kind",
     }
 
 
@@ -85,6 +98,7 @@ def test_observation_is_frozen():
         human_requested=False,
         clarification_facts=(),
         new_issue=None,
+        request_kind=RequestKind.PROBLEM,
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
         obs.scope = ObservationScope.UNCLEAR  # type: ignore[misc]
@@ -101,6 +115,7 @@ def test_reported_actions_accepts_unmappable_and_mappable():
         human_requested=False,
         clarification_facts=("model=X",),
         new_issue=None,
+        request_kind=RequestKind.PROBLEM,
     )
     assert isinstance(obs.reported_actions, tuple)
     assert obs.reported_actions[0].step_id is None

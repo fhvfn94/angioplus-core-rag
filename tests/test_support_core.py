@@ -433,6 +433,47 @@ def test_every_dependency_is_injectable():
 # 7-8. NOT WIRED ANYWHERE YET / server.py UNTOUCHED
 # ============================================================
 
+def _imports_support_core(path: Path) -> bool:
+    """True when ``path`` has a REAL production dependency on ``support_core``.
+
+    AST/import-aware: only actual ``import`` / ``from ... import`` statements
+    count as wiring. A docstring, comment or string literal that merely
+    *mentions* ``support_core`` / ``SupportCore`` is NOT a dependency (it wires
+    nothing) and must never be flagged.
+    """
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+    except (SyntaxError, ValueError):
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.name
+                if name == "support.support_core" or name.startswith(
+                    "support.support_core."
+                ):
+                    return True
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            # ``from support.support_core import ...``
+            if module == "support.support_core" or module.startswith(
+                "support.support_core."
+            ):
+                return True
+            # ``from .support_core import ...`` (relative, inside support/)
+            if node.level >= 1 and (
+                module == "support_core" or module.startswith("support_core.")
+            ):
+                return True
+            # ``from support import support_core`` / ``from . import support_core``
+            if module in ("support", ""):
+                for alias in node.names:
+                    if alias.name == "support_core":
+                        return True
+    return False
+
+
 def test_no_runtime_module_imports_support_core_yet():
     core_path = Path(sc.__file__).resolve()
     root = _repo_root()
@@ -445,8 +486,7 @@ def test_no_runtime_module_imports_support_core_yet():
                 continue
             if "tests" in path.parts:
                 continue
-            text = path.read_text(encoding="utf-8", errors="ignore")
-            if "support_core" in text or "SupportCore" in text:
+            if _imports_support_core(path):
                 offenders.append(str(path))
 
     assert offenders == []
@@ -455,9 +495,7 @@ def test_no_runtime_module_imports_support_core_yet():
         path = root / relative
         if not path.exists():
             continue
-        text = path.read_text(encoding="utf-8")
-        assert "support_core" not in text, relative
-        assert "SupportCore" not in text, relative
+        assert not _imports_support_core(path), relative
 
 
 def test_server_py_is_untouched_by_this_slice():

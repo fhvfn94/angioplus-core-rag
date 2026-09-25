@@ -1,0 +1,295 @@
+"""
+Turn Dispatch -- the SINGLE family-dispatch boundary (Slice 11B.1b.4c).
+
+Infrastructure only. NOT imported by any production runtime path (server.py,
+alice_support_agent.py, the Support Core composition root, n8n, Tracker, DB,
+retrieval, File Search). It is a standalone application service; runtime /
+SupportCore integration and the global semantic-policy owner are LATER slices.
+
+WHAT THIS MODULE IS
+-------------------
+ONE incoming support turn is understood ONCE, its processing FAMILY is chosen
+DETERMINISTICALLY, and EXACTLY ONE capability runs:
+
+    message, state, procedure
+      -> analyze_support_turn(...)            (EXACTLY ONE analysis)
+      -> SemanticObservation
+      -> select_turn_family(observation)      (the ONLY family decision)
+      -> EXACTLY ONE family branch
+           |- PROCEDURE_SUPPORT -> SupportTurnExecutor
+           |                        .execute_persisted_turn_from_observation
+           |                        (the SAME observation; single CAS writer)
+           |- KNOWLEDGE_QA      -> answer_question(...)
+           |- CLARIFICATION     -> clarify()
+
+SINGLE-ANALYSIS INVARIANT (non-negotiable)
+------------------------------------------
+The analyzer runs AT MOST ONCE per turn. The procedure branch consumes the
+SAME observation VERBATIM through the executor's precomputed-observation
+path, which has NO analyzer argument, so ``analyze -> executor -> analyze``
+cannot be expressed. KNOWLEDGE_QA and CLARIFICATION never touch the analyzer
+or the procedure executor.
+
+OWNS / DOES NOT OWN
+-------------------
+OWNS: the ONE observation, deterministic family selection, delegation to
+exactly one family.
+DOES NOT OWN: procedure reducer logic, procedure routing policy, the CAS
+implementation, knowledge retrieval implementation, response generation
+implementation, procedure resolution / selection (the caller supplies the
+already-resolved ``state`` / ``procedure``), HTTP / runtime / channel
+behaviour, FSM / Tracker, message persistence, idempotency.
+
+GLOBAL SEMANTIC POLICY (deliberately NOT here)
+----------------------------------------------
+``human_requested``, ``scope`` and ``problem_status`` are GLOBAL semantic
+gates that the FROZEN router owns today (inside the procedure pipeline). This
+dispatcher does NOT evaluate them and does NOT duplicate that policy. A SINGLE
+owner for those gates is designed in a LATER slice; until then this module
+must NOT be wired into any runtime path.
+
+NO-PROCEDURE OUTCOME
+--------------------
+A PROBLEM turn with NO resolved procedure candidate runs NO capability: the
+dispatcher returns :class:`NoProcedureDispatch` -- no wording invented, no
+executor call without a ``Procedure``, and NOT re-classified as CLARIFICATION
+(the request kind was PROBLEM, not UNCLEAR). The application boundary maps it
+to its EXISTING ``NO_PROCEDURE`` outcome.
+
+ASYNC
+-----
+``dispatch`` is async because the procedure branch awaits the async executor.
+The analyzer provider and the Knowledge QA path are SYNC and network-backed;
+they are offloaded with ``asyncio.to_thread`` so they never block the event
+loop. ``clarify()`` is pure and is called directly.
+
+ERROR SEMANTICS
+---------------
+No ``try/except`` and NO catch-all policy is added here. Every branch is
+already total except the executor's optimistic CAS, whose
+:class:`~support.procedure_state_store.ProcedureStateConflict` propagates
+UNCHANGED (no retry, no overwrite). Knowledge statuses (``ANSWERED`` /
+``NOT_ANSWERED`` / ``INTERNAL_ERROR``) are preserved intact; the analyzer
+fail-safe (``request_kind=UNCLEAR``) naturally lands on CLARIFICATION.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import Mapping, Optional, Sequence, Union
+
+from support.alice_analyzer import AnalyzerProvider
+from support.clarification import ClarificationResult, clarify
+from support.knowledge import KnowledgeBackend
+from support.knowledge_qa import (
+    KnowledgeQAProvider,
+    KnowledgeQAResult,
+    answer_question,
+)
+from support.observation import SemanticObservation
+from support.orchestrator import analyze_support_turn
+from support.procedure import Procedure
+from support.procedure_state import ProcedureState
+from support.response_generator import ResponseProvider
+from support.turn_executor import PersistedTurnResult, SupportTurnExecutor
+from support.turn_family import TurnFamily, select_turn_family
+
+
+# ============================================================
+# DISPATCH RESULT (two thin types, no ``None`` policy signal)
+# ============================================================
+
+@dataclass(frozen=True)
+class ExecutedDispatch:
+    """A capability DID run.
+
+    The family-native result is preserved INTACT behind ``family`` and
+    ``text`` is that family's single user-facing string. ``text`` is ALWAYS
+    non-blank (enforced) and EXACTLY the one payload matching ``family`` is
+    set -- so an executed result can never be text-less and ``None`` can never
+    act as a hidden policy signal.
+
+    No HTTP / case_action / FSM / Tracker / channel / dedup / runtime
+    vocabulary is introduced: this is internal support-domain output only.
+    """
+
+    family: TurnFamily
+    text: str
+    procedure_result: Optional[PersistedTurnResult] = None
+    knowledge_result: Optional[KnowledgeQAResult] = None
+    clarification_result: Optional[ClarificationResult] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.family, TurnFamily):
+            raise ValueError("family must be a TurnFamily.")
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("text must be a non-blank string.")
+
+        expected = {
+            TurnFamily.PROCEDURE_SUPPORT: PersistedTurnResult,
+            TurnFamily.KNOWLEDGE_QA: KnowledgeQAResult,
+            TurnFamily.CLARIFICATION: ClarificationResult,
+        }[self.family]
+        payloads = {
+            "procedure_result": self.procedure_result,
+            "knowledge_result": self.knowledge_result,
+            "clarification_result": self.clarification_result,
+        }
+        set_names = [name for name, value in payloads.items() if value is not None]
+        if len(set_names) != 1 or not isinstance(
+            payloads[set_names[0]], expected
+        ):
+            raise ValueError(
+                f"{self.family} requires exactly its one matching payload."
+            )
+
+
+@dataclass(frozen=True)
+class NoProcedureDispatch:
+    """A PROBLEM turn resolved to NO procedure candidate.
+
+    NO capability ran: no executor call (there is no ``Procedure``), no
+    wording invented, no ``None`` policy signal. It is deliberately NOT the
+    CLARIFICATION family. The application boundary maps it, in a later slice,
+    to its EXISTING ``NO_PROCEDURE`` outcome (nothing persisted). Carries no
+    fields -- a type-level marker.
+    """
+
+
+# What ``SupportTurnDispatcher.dispatch`` returns.
+DispatchResult = Union[ExecutedDispatch, NoProcedureDispatch]
+
+
+# ============================================================
+# DISPATCHER
+# ============================================================
+
+class SupportTurnDispatcher:
+    """Understand ONE turn ONCE, choose a family, run exactly one capability.
+
+    Dependency-injected and side-effect-free beyond the ONE delegated
+    family call. It owns NO persistence (the executor does) and NO policy
+    beyond the deterministic :func:`select_turn_family`. The caller supplies
+    the already-resolved ``state`` (read-only context) and ``procedure``
+    (resolved candidate) -- there is NO ProcedureCatalog / resolver here.
+    """
+
+    def __init__(
+        self,
+        *,
+        analyzer_provider: AnalyzerProvider,
+        procedure_executor: SupportTurnExecutor,
+        knowledge_backend: KnowledgeBackend,
+        knowledge_qa_provider: KnowledgeQAProvider,
+        response_provider: Optional[ResponseProvider] = None,
+    ) -> None:
+        self._analyzer_provider = analyzer_provider
+        self._procedure_executor = procedure_executor
+        self._knowledge_backend = knowledge_backend
+        self._knowledge_qa_provider = knowledge_qa_provider
+        self._response_provider = response_provider
+
+    async def dispatch(
+        self,
+        *,
+        conversation_id: str,
+        message: str,
+        history: Sequence[Mapping[str, str]] = (),
+        state: Optional[ProcedureState] = None,
+        procedure: Optional[Procedure] = None,
+    ) -> DispatchResult:
+        """Analyze ONCE, select the family, and delegate to exactly one.
+
+        ``state`` / ``procedure`` are the already-resolved read-only context
+        and candidate produced by the application boundary; they are NEVER
+        mutated and never re-derived here. ``history`` is an opaque
+        pass-through to the analyzer.
+        """
+        # 1. The ONE analysis. The provider is sync + network-backed, so it
+        #    is offloaded to a thread to keep the event loop free.
+        observation: SemanticObservation = await asyncio.to_thread(
+            analyze_support_turn,
+            message=message,
+            history=history,
+            state=state,
+            procedure=procedure,
+            analyzer_provider=self._analyzer_provider,
+        )
+
+        # 2. The ONLY family decision (reads request_kind alone).
+        family = select_turn_family(observation)
+
+        # 3. Delegate to EXACTLY ONE family, using the SAME observation.
+        if family is TurnFamily.PROCEDURE_SUPPORT:
+            return await self._dispatch_procedure(
+                conversation_id, observation, procedure
+            )
+        if family is TurnFamily.KNOWLEDGE_QA:
+            return await self._dispatch_knowledge(message)
+        return self._dispatch_clarification()
+
+    # ------------------------------------------------------------
+    # FAMILY BRANCHES
+    # ------------------------------------------------------------
+
+    async def _dispatch_procedure(
+        self,
+        conversation_id: str,
+        observation: SemanticObservation,
+        procedure: Optional[Procedure],
+    ) -> DispatchResult:
+        """Run the procedure pipeline from the SAME observation.
+
+        Never call the executor without a ``Procedure``: a missing candidate
+        is a NO-PROCEDURE outcome, not a fabricated turn.
+        """
+        if procedure is None:
+            return NoProcedureDispatch()
+
+        persisted = (
+            await self._procedure_executor.execute_persisted_turn_from_observation(
+                conversation_id=conversation_id,
+                observation=observation,
+                procedure=procedure,
+                knowledge_backend=self._knowledge_backend,
+                response_provider=self._response_provider,
+            )
+        )
+        return ExecutedDispatch(
+            family=TurnFamily.PROCEDURE_SUPPORT,
+            text=persisted.turn.assistant_text,
+            procedure_result=persisted,
+        )
+
+    async def _dispatch_knowledge(self, message: str) -> DispatchResult:
+        """Answer the factual question. Retrieval + provider are sync, so the
+        whole QA call is offloaded to a thread. No procedure, no persistence."""
+        result = await asyncio.to_thread(
+            answer_question,
+            message,
+            backend=self._knowledge_backend,
+            provider=self._knowledge_qa_provider,
+        )
+        return ExecutedDispatch(
+            family=TurnFamily.KNOWLEDGE_QA,
+            text=result.text,
+            knowledge_result=result,
+        )
+
+    def _dispatch_clarification(self) -> DispatchResult:
+        """Return the deterministic clarification prompt (pure, no I/O)."""
+        result = clarify()
+        return ExecutedDispatch(
+            family=TurnFamily.CLARIFICATION,
+            text=result.text,
+            clarification_result=result,
+        )
+
+
+__all__ = [
+    "DispatchResult",
+    "ExecutedDispatch",
+    "NoProcedureDispatch",
+    "SupportTurnDispatcher",
+]

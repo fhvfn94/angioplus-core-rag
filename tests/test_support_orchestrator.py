@@ -11,8 +11,11 @@ only the three INJECTED ports are faked:
 
 Plus AST/structural guards that pin the Orchestrator's boundaries (no routing
 policy, no fabricated fallbacks, no frozen-slice edits). Wiring is allowed
-from exactly ONE sanctioned production module -- the Slice 9 application
-boundary ``support/turn_executor.py`` -- and nowhere else.
+from exactly TWO sanctioned production modules with DIFFERENT permissions --
+the Slice 9 application boundary ``support/turn_executor.py`` (the full
+procedure orchestration API) and the family dispatcher
+``support/turn_dispatch.py`` (the ``analyze_support_turn`` boundary ONLY) --
+and nowhere else.
 """
 
 from __future__ import annotations
@@ -971,21 +974,35 @@ _SKIP_DIRS = {
     ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "dist",
 }
 
-# The Slice 9 application boundary is the ONE sanctioned production module that
-# composes the orchestrator with persistence. Every OTHER production module
-# (transports, server, workflows) must still not import the orchestrator.
-_ORCHESTRATOR_WIRING_POINT = "turn_executor.py"
+# Exactly TWO sanctioned production importers of ``support.orchestrator``, with
+# DIFFERENT permissions:
+#   * ``turn_executor.py`` -- the Slice 9 application boundary; may use the full
+#     procedure orchestration API;
+#   * ``turn_dispatch.py`` -- the family dispatcher; may import ONLY the single
+#     analyze boundary (``analyze_support_turn``) and must delegate procedure
+#     execution through
+#     ``SupportTurnExecutor.execute_persisted_turn_from_observation``.
+# The value is the set of orchestrator names the module may import
+# (``None`` == any). Every OTHER production module (transports, server,
+# workflows, support_core, ...) must still not import the orchestrator at all.
+_SANCTIONED_ORCHESTRATOR_IMPORTERS: dict[str, Optional[frozenset[str]]] = {
+    "turn_executor.py": None,
+    "turn_dispatch.py": frozenset({"analyze_support_turn"}),
+}
 
 
-def test_only_turn_executor_imports_orchestrator():
+def test_only_sanctioned_modules_import_orchestrator():
     repo_root = Path(__file__).resolve().parents[1]
     offenders = []
     for path in repo_root.rglob("*.py"):
         if any(part in _SKIP_DIRS for part in path.parts):
             continue
-        if path.name in {"orchestrator.py", _ORCHESTRATOR_WIRING_POINT}:
-            continue
         if "tests" in path.parts:
+            continue
+        if (
+            path.name == "orchestrator.py"
+            or path.name in _SANCTIONED_ORCHESTRATOR_IMPORTERS
+        ):
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         if "support.orchestrator" in text or "from support import orchestrator" in text:
@@ -993,13 +1010,44 @@ def test_only_turn_executor_imports_orchestrator():
     assert offenders == []
 
 
-def test_sanctioned_wiring_point_is_pinned():
-    # Guard the guard: the exempted module must exist and really import the
+def test_sanctioned_wiring_points_are_pinned():
+    # Guard the guard: each exempted module must exist and really import the
     # orchestrator, so the exemption can never silently widen.
-    wiring = (
-        Path(__file__).resolve().parents[1]
-        / "support"
-        / _ORCHESTRATOR_WIRING_POINT
+    root = Path(__file__).resolve().parents[1] / "support"
+    for name in _SANCTIONED_ORCHESTRATOR_IMPORTERS:
+        wiring = root / name
+        assert wiring.exists(), name
+        assert "support.orchestrator" in wiring.read_text(encoding="utf-8"), name
+
+
+def test_turn_dispatch_may_import_only_the_analyze_boundary():
+    # The dispatcher's orchestrator permission is EXACTLY the analyze boundary:
+    # it must not reach the procedure execution API
+    # (process_support_turn / process_support_turn_from_observation /
+    # TurnResult) -- procedure execution is delegated through
+    # SupportTurnExecutor.execute_persisted_turn_from_observation.
+    dispatch = (
+        Path(__file__).resolve().parents[1] / "support" / "turn_dispatch.py"
     )
-    assert wiring.exists()
-    assert "support.orchestrator" in wiring.read_text(encoding="utf-8")
+    tree = ast.parse(dispatch.read_text(encoding="utf-8"))
+
+    imported: set[str] = set()
+    referenced: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "support.orchestrator"
+        ):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.Name):
+            referenced.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            referenced.add(node.attr)
+
+    assert imported == {"analyze_support_turn"}
+    for forbidden in (
+        "process_support_turn",
+        "process_support_turn_from_observation",
+        "TurnResult",
+    ):
+        assert forbidden not in referenced, forbidden

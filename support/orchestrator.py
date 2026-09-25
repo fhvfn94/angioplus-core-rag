@@ -41,6 +41,22 @@ CANONICAL LIFECYCLE (each step exactly once, in order)
     -> project cursor (mechanical)   -> next_state
     -> TurnResult
 
+TWO ENTRY POINTS (single-analysis boundary)
+-------------------------------------------
+The lifecycle above is composed from TWO public stages so a caller can run
+the analyzer EXACTLY ONCE and then feed the resulting observation into the
+procedure pipeline:
+
+  * :func:`analyze_support_turn` -- the analyze boundary. It produces the
+    ONE :class:`SemanticObservation` and owns the last-recommendation
+    context, so no caller re-derives that context.
+  * :func:`process_support_turn_from_observation` -- the PURE downstream
+    (reduce -> route -> retrieve -> render). It takes a PRECOMPUTED
+    observation and has NO analyzer parameter, so a second analysis is
+    impossible by signature.
+
+:func:`process_support_turn` is retained, unchanged, as their composition.
+
 Reduction happens BEFORE routing on purpose: the frozen cross-layer contracts
 verify that a "didn't help" reference, a same-turn outcome and an uncertain
 observation only converge correctly when the Router reads the REDUCED state
@@ -226,8 +242,100 @@ def _project_next_state(
 
 
 # ============================================================
-# PUBLIC ENTRY POINT
+# PUBLIC ENTRY POINTS (single-analysis boundary)
 # ============================================================
+
+def analyze_support_turn(
+    *,
+    message: str,
+    history: Sequence[Mapping[str, str]] = (),
+    state: Optional[ProcedureState] = None,
+    procedure: Optional[Procedure] = None,
+    analyzer_provider: AnalyzerProvider,
+) -> SemanticObservation:
+    """Run the frozen Analyzer boundary EXACTLY once for ONE support turn.
+
+    This is the SINGLE analysis point. It mirrors exactly what
+    :func:`process_support_turn` used to do inline before the split:
+
+      * the previous state is derived (and NEVER mutated);
+      * ``last_recommendation`` is read from the previous state via the
+        single :func:`_last_recommendation` source of truth (identity
+        binding is unnecessary here -- it affects only the state carried
+        into the reducer, never the analyzer prompt);
+      * the fail-safe, provider-injected :func:`analyze` is invoked once.
+
+    A caller (e.g. a future family dispatcher) invokes this ONCE and then
+    hands the returned observation to
+    :func:`process_support_turn_from_observation`, so the analyzer is never
+    run twice for the same user turn.
+    """
+    previous_state = state if state is not None else initial_state()
+    return analyze(
+        message=message,
+        history=history,
+        procedure=procedure,
+        last_recommendation=_last_recommendation(previous_state, procedure),
+        provider=analyzer_provider,
+    )
+
+
+def process_support_turn_from_observation(
+    *,
+    observation: SemanticObservation,
+    state: Optional[ProcedureState] = None,
+    procedure: Optional[Procedure] = None,
+    knowledge_backend: Optional[KnowledgeBackend] = None,
+    response_provider: Optional[ResponseProvider] = None,
+) -> TurnResult:
+    """Run the procedure pipeline from a PRECOMPUTED observation.
+
+    The pure downstream half of the lifecycle (reduce -> route -> retrieve ->
+    render -> project). It is a mechanical consumer: it makes NO decision of
+    its own and fabricates NO fallback. It has NO analyzer argument, so it
+    can NEVER call the analyzer a second time.
+
+    ``observation`` is consumed VERBATIM (never re-interpreted, never
+    re-derived). Everything else is identical to the frozen lifecycle: the
+    reducer runs exactly once, the Router exactly once, retrieval only for
+    an authorized RECOMMEND_STEP, and the Generator exactly once.
+    """
+    # Continuity inputs (the previous state is NEVER mutated).
+    previous_state = state if state is not None else initial_state()
+    previous_state = _bind_procedure_identity(previous_state, procedure)
+
+    # Record WHAT happened -- EXACTLY once (the single mutation).
+    working_state = update_procedure_state(
+        previous_state, observation, procedure
+    )
+
+    # Decide WHAT to do next (the ONLY decision maker; reads, never mutates).
+    decision = route(working_state, observation, procedure)
+
+    # Evidence ONLY for an authorized RECOMMEND_STEP (invariant L).
+    knowledge = _authorized_evidence(decision, procedure, knowledge_backend)
+
+    # Render the MADE decision (the ONLY renderer; never alters the decision).
+    response = render_response(
+        decision,
+        procedure=procedure,
+        knowledge=knowledge,
+        provider=response_provider,
+    )
+
+    # Mechanical projection of the Router's own output into the next state.
+    next_state = _project_next_state(working_state, decision)
+
+    return TurnResult(
+        assistant_text=response.text,
+        decision=decision,
+        state=next_state,
+        observation=observation,
+        response=response,
+        knowledge=knowledge,
+        escalation_reason=decision.escalate_reason,
+    )
+
 
 def process_support_turn(
     *,
@@ -268,58 +376,36 @@ def process_support_turn(
         Total: never raises for any analyzer/knowledge/provider outcome, because
         every callee is already fail-safe.
 
-    The lifecycle is fixed and each step runs exactly once:
+    This is a thin composition of the two public stages; the lifecycle still
+    runs exactly once overall:
 
-      analyze -> update_procedure_state -> route -> (retrieve?) -> render ->
-      project cursor -> TurnResult.
+      analyze_support_turn -> process_support_turn_from_observation
+      (update_procedure_state -> route -> (retrieve?) -> render ->
+       project cursor -> TurnResult).
     """
-    # 1. Continuity inputs (the previous state is NEVER mutated).
-    previous_state = state if state is not None else initial_state()
-    previous_state = _bind_procedure_identity(previous_state, procedure)
-
-    # 2. Message understanding (frozen, fail-safe Analyzer boundary).
-    observation = analyze(
+    # 1. Message understanding -- the ONE analysis, via the shared boundary.
+    observation = analyze_support_turn(
         message=message,
         history=history,
+        state=state,
         procedure=procedure,
-        last_recommendation=_last_recommendation(previous_state, procedure),
-        provider=analyzer_provider,
+        analyzer_provider=analyzer_provider,
     )
 
-    # 3. Record WHAT happened -- EXACTLY once (the single mutation).
-    working_state = update_procedure_state(
-        previous_state, observation, procedure
-    )
-
-    # 4. Decide WHAT to do next (the ONLY decision maker; reads, never mutates).
-    decision = route(working_state, observation, procedure)
-
-    # 5. Evidence ONLY for an authorized RECOMMEND_STEP (invariant L).
-    knowledge = _authorized_evidence(decision, procedure, knowledge_backend)
-
-    # 6. Render the MADE decision (the ONLY renderer; never alters the decision).
-    response = render_response(
-        decision,
-        procedure=procedure,
-        knowledge=knowledge,
-        provider=response_provider,
-    )
-
-    # 7. Mechanical projection of the Router's own output into the next state.
-    next_state = _project_next_state(working_state, decision)
-
-    return TurnResult(
-        assistant_text=response.text,
-        decision=decision,
-        state=next_state,
+    # 2-7. Reduce -> route -> retrieve -> render -> project, from that single
+    #      precomputed observation.
+    return process_support_turn_from_observation(
         observation=observation,
-        response=response,
-        knowledge=knowledge,
-        escalation_reason=decision.escalate_reason,
+        state=state,
+        procedure=procedure,
+        knowledge_backend=knowledge_backend,
+        response_provider=response_provider,
     )
 
 
 __all__ = [
     "TurnResult",
+    "analyze_support_turn",
+    "process_support_turn_from_observation",
     "process_support_turn",
 ]

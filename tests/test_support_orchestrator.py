@@ -18,6 +18,7 @@ boundary ``support/turn_executor.py`` -- and nowhere else.
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -26,9 +27,22 @@ from typing import Any, Optional, Sequence
 import pytest
 
 import support.orchestrator as orchestrator
+from support import alice_analyzer
 from support.knowledge import KnowledgeItem, KnowledgeStatus
-from support.observation import ObservationScope
-from support.orchestrator import TurnResult, process_support_turn
+from support.observation import (
+    ObservationScope,
+    ProblemStatus,
+    ReportedAction,
+    RequestKind,
+    SemanticObservation,
+    StepOutcome,
+)
+from support.orchestrator import (
+    TurnResult,
+    analyze_support_turn,
+    process_support_turn,
+    process_support_turn_from_observation,
+)
 from support.procedure import load_procedure, load_procedure_from_dict
 from support.procedure_state import initial_state
 from support.response_generator import ResponseStatus
@@ -111,6 +125,7 @@ def _obs_json(
     human_requested: bool = False,
     clarification_facts=(),
     new_issue: Optional[str] = None,
+    request_kind: str = "problem",
 ) -> str:
     """A strictly-valid analyzer JSON object (exact schema)."""
     return json.dumps(
@@ -124,6 +139,7 @@ def _obs_json(
             "human_requested": human_requested,
             "clarification_facts": list(clarification_facts),
             "new_issue": new_issue,
+            "request_kind": request_kind,
         }
     )
 
@@ -697,6 +713,146 @@ def test_knowledge_never_called_outside_recommend_step():
         )
         assert result.decision.action is not RouteAction.RECOMMEND_STEP
         assert backend.calls == []
+
+
+# ============================================================
+# SINGLE-ANALYSIS BOUNDARY (Slice 11B.1b.4a)
+# ============================================================
+
+def _problem_observation() -> SemanticObservation:
+    """A minimal, valid IN_SCOPE report observation (no analyzer involved)."""
+    return SemanticObservation(
+        scope=ObservationScope.IN_SCOPE,
+        reported_actions=(),
+        problem_status=None,
+        human_requested=False,
+        clarification_facts=(),
+        new_issue=None,
+        request_kind=RequestKind.PROBLEM,
+    )
+
+
+def _forbid_analyzer(monkeypatch):
+    def _boom(*args, **kwargs):
+        raise AssertionError("analyzer must NOT be called on this path")
+
+    monkeypatch.setattr(orchestrator, "analyze", _boom)
+
+
+def test_precomputed_path_never_calls_analyzer(monkeypatch):
+    _forbid_analyzer(monkeypatch)
+    procedure = _black_screen()
+
+    result = process_support_turn_from_observation(
+        observation=_problem_observation(),
+        procedure=procedure,
+        knowledge_backend=FakeKnowledge(),
+        response_provider=FakeRenderer(),
+    )
+
+    assert result.decision.action is RouteAction.RECOMMEND_STEP
+    assert result.decision.next_step == "CHECK_POWER"
+    assert result.state.last_recommended_step == "CHECK_POWER"
+
+
+def test_legacy_and_precomputed_paths_are_equivalent():
+    procedure = _black_screen()
+
+    legacy = process_support_turn(
+        message="m",
+        procedure=procedure,
+        analyzer_provider=FakeAnalyzer(_obs_json()),
+        knowledge_backend=FakeKnowledge(),
+        response_provider=None,
+    )
+
+    observation = analyze_support_turn(
+        message="m",
+        procedure=procedure,
+        analyzer_provider=FakeAnalyzer(_obs_json()),
+    )
+    precomputed = process_support_turn_from_observation(
+        observation=observation,
+        procedure=procedure,
+        knowledge_backend=FakeKnowledge(),
+        response_provider=None,
+    )
+
+    assert legacy == precomputed
+
+
+def test_legacy_path_analyzes_exactly_once():
+    procedure = _black_screen()
+    analyzer = FakeAnalyzer(_obs_json())
+
+    process_support_turn(
+        message="m", procedure=procedure, analyzer_provider=analyzer
+    )
+
+    assert len(analyzer.calls) == 1
+
+
+def test_analyze_boundary_analyzes_exactly_once():
+    procedure = _black_screen()
+    analyzer = FakeAnalyzer(_obs_json())
+
+    observation = analyze_support_turn(
+        message="m", procedure=procedure, analyzer_provider=analyzer
+    )
+
+    assert len(analyzer.calls) == 1
+    assert observation.scope is ObservationScope.IN_SCOPE
+
+
+def test_precomputed_observation_is_consumed_verbatim():
+    procedure = _black_screen()
+    obs = SemanticObservation(
+        scope=ObservationScope.IN_SCOPE,
+        reported_actions=(
+            ReportedAction(step_id="CHECK_POWER", outcome=StepOutcome.FAILED),
+        ),
+        problem_status=ProblemStatus.ONGOING,
+        human_requested=False,
+        clarification_facts=(),
+        new_issue=None,
+        request_kind=RequestKind.PROBLEM,
+    )
+
+    result = process_support_turn_from_observation(
+        observation=obs, procedure=procedure
+    )
+
+    assert result.decision.action is RouteAction.RECOMMEND_STEP
+    assert result.decision.next_step == "CHECK_CABLE"
+    assert result.observation is obs
+
+
+def test_precomputed_unclear_fails_safe_through_existing_semantics():
+    procedure = _black_screen()
+
+    result = process_support_turn_from_observation(
+        observation=alice_analyzer._fail_safe_observation(),
+        procedure=procedure,
+        knowledge_backend=FakeKnowledge(),
+    )
+
+    assert result.decision.action is RouteAction.CLARIFY
+    assert result.decision.clarify_reason is ClarifyReason.PENDING_CLARIFICATION
+    assert result.state.pending_clarification is True
+
+
+def test_precomputed_entry_has_no_analyzer_parameter():
+    params = set(
+        inspect.signature(
+            orchestrator.process_support_turn_from_observation
+        ).parameters
+    )
+    assert "analyzer_provider" not in params
+    assert not any("analyzer" in p or p == "provider" for p in params)
+    # The analyze boundary DOES own the single analyzer.
+    assert "analyzer_provider" in inspect.signature(
+        orchestrator.analyze_support_turn
+    ).parameters
 
 
 # ============================================================

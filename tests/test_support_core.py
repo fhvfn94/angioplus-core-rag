@@ -19,17 +19,20 @@ ONE turn by DELEGATING to them:
      outside the composition boundary);
   7. no runtime module imports ``support_core`` yet;
   8. ``yandex/chat/server.py`` stays untouched by this sub-slice;
-  9. ``handle_turn`` resolves the Procedure cold-start via
-     ``ProcedureCatalog.select`` (unique match -> that Procedure; no match or
-     ambiguous -> safe ``NO_PROCEDURE`` with the executor NOT called);
+  9. ``handle_turn`` resolves the CANDIDATE Procedure cold-start via
+     ``ProcedureCatalog.select`` (unique match -> that Procedure, otherwise
+     ``None``) and ALWAYS dispatches the message afterwards (the ONE analysis
+     still happens when the candidate is ``None``);
  10. a BOUND conversation resolves via the EXACT persisted
      ``(procedure_id, procedure_version)`` pair (``catalog.get``), never
      re-running ``select``, never upgrading/falling back to another version
      and never using ``latest``;
- 11. an un-rehydratable identity -> safe ``PROCEDURE_NOT_FOUND`` with the
-     executor NOT called;
- 12. the executor receives the SupportCore-composed analyzer / knowledge /
-     response providers and the caller's opaque ``history``;
+ 11. an un-rehydratable identity -> safe ``PROCEDURE_NOT_FOUND``, FAIL CLOSED
+     before any analysis;
+ 12. the dispatcher's ONE analysis + typed result is projected into the
+     public outcome: PROBLEM -> TURN_EXECUTED / NO_PROCEDURE, INFORMATION ->
+     KNOWLEDGE_QA, UNCLEAR -> CLARIFICATION, human request -> ESCALATE, out
+     of scope -> OUT_OF_SCOPE;
  13. a ``ProcedureStateConflict`` propagates unchanged (no retry, no
      overwrite) and SupportCore never persists ``ProcedureState`` itself;
  14. the durable read -> process -> CAS WRITE transaction lifecycle stays
@@ -41,13 +44,20 @@ ONE turn by DELEGATING to them:
 from __future__ import annotations
 
 import ast
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from support import support_core as sc
 from support.alice_analyzer_yandex import YandexAnalyzerProvider
+from support.clarification import clarify
+from support.global_policy import GlobalAction
+from support.knowledge import KnowledgeItem
+from support.knowledge_qa import KnowledgeQAStatus, KnowledgeQAResult
+from support.knowledge_qa_yandex import YandexKnowledgeQAProvider
 from support.knowledge_yandex import YandexKnowledgeBackend
 from support.procedure import load_procedure_from_dict
 from support.procedure_catalog import ProcedureCatalog
@@ -59,6 +69,7 @@ from support.procedure_state_store import (
 )
 from support.response_generator_yandex import YandexExplanationProvider
 from support.turn_executor import PersistedTurnResult, SupportTurnExecutor
+from support.turn_projection import project_global_terminal
 
 # ============================================================
 # DOUBLES (no network, no credentials, no DB)
@@ -85,6 +96,74 @@ class _FakeSessionFactory:
 
 def _sentinel_store_factory(session):
     return ("state-store-for", session)
+
+
+def _obs_json(request_kind, *, scope="in_scope", human_requested=False):
+    return json.dumps(
+        {
+            "scope": scope,
+            "reported_actions": [],
+            "problem_status": None,
+            "human_requested": human_requested,
+            "clarification_facts": [],
+            "new_issue": None,
+            "request_kind": request_kind,
+        }
+    )
+
+
+class _RecordingAnalyzer:
+    """Frozen Slice 4 analyzer double: returns a fixed observation JSON and
+    records every prompt / history it was given (proves ONE analysis and the
+    opaque ``history`` pass-through)."""
+
+    def __init__(
+        self,
+        request_kind="problem",
+        *,
+        scope="in_scope",
+        human_requested=False,
+        error=None,
+    ) -> None:
+        self._raw = _obs_json(
+            request_kind, scope=scope, human_requested=human_requested
+        )
+        self._error = error
+        self.calls = 0
+        self.prompts: list = []
+        self.histories: list = []
+
+    def __call__(self, prompt, history=()):
+        self.calls += 1
+        self.prompts.append(prompt)
+        self.histories.append(list(history))
+        if self._error is not None:
+            raise self._error
+        return self._raw
+
+
+class _FakeBackend:
+    """``KnowledgeBackend`` double."""
+
+    def __init__(self, items=()) -> None:
+        self._items = list(items)
+        self.calls = 0
+
+    def search(self, query, *, max_num_results):
+        self.calls += 1
+        return list(self._items)
+
+
+class _FakeQA:
+    """``KnowledgeQAProvider`` double."""
+
+    def __init__(self, raw='{"answer": "Grounded answer."}') -> None:
+        self._raw = raw
+        self.calls = 0
+
+    def __call__(self, prompt):
+        self.calls += 1
+        return self._raw
 
 
 def _procedure():
@@ -358,7 +437,11 @@ def test_support_core_contains_no_routing_reducing_retrieval_or_generation():
 
 def test_public_api_surface():
     assert set(sc.__all__) == {
+        "CLARIFICATION",
+        "ESCALATE",
+        "KNOWLEDGE_QA",
         "NO_PROCEDURE",
+        "OUT_OF_SCOPE",
         "PROCEDURE_NOT_FOUND",
         "TURN_EXECUTED",
         "SupportCore",
@@ -401,6 +484,7 @@ def test_construction_needs_no_credentials(monkeypatch):
 
     assert isinstance(core.analyzer_provider, YandexAnalyzerProvider)
     assert isinstance(core.knowledge_backend, YandexKnowledgeBackend)
+    assert isinstance(core.knowledge_qa_provider, YandexKnowledgeQAProvider)
     assert isinstance(core.response_provider, YandexExplanationProvider)
 
 
@@ -408,24 +492,30 @@ def test_every_dependency_is_injectable():
     catalog = ProcedureCatalog([_procedure()])
     sessions = _FakeSessionFactory()
     executor = object()
+    qa = object()
+    dispatcher = object()
 
     core = sc.SupportCore(
         procedure_catalog=catalog,
         analyzer_provider="analyzer",
         knowledge_backend="knowledge",
+        knowledge_qa_provider=qa,
         response_provider="response",
         session_factory=sessions,
         store_factory=_sentinel_store_factory,
         turn_executor=executor,
+        turn_dispatcher=dispatcher,
     )
 
     assert core.procedure_catalog is catalog
     assert core.analyzer_provider == "analyzer"
     assert core.knowledge_backend == "knowledge"
+    assert core.knowledge_qa_provider is qa
     assert core.response_provider == "response"
     assert core.session_factory is sessions
     assert core.store_factory is _sentinel_store_factory
     assert core.turn_executor is executor  # injected, not rebuilt
+    assert core.turn_dispatcher is dispatcher  # injected, not rebuilt
     assert sessions.opened == 0
 
 
@@ -563,20 +653,31 @@ class _ReadOnlyStore:
 
 
 class _RecordingExecutor:
-    """SupportTurnExecutor double: records the ONE delegated call."""
+    """SupportTurnExecutor double: records the ONE delegated call.
+
+    The dispatcher MUST use the PRECOMPUTED-observation path (single
+    analysis); ``execute_persisted_turn`` (which would re-analyze) explodes.
+    """
 
     def __init__(self, result=None, error=None, events=None) -> None:
         self.result = result
         self.error = error
         self.events = events if events is not None else []
         self.calls: list[dict] = []
+        self.observations: list = []
 
-    async def execute_persisted_turn(self, **kwargs):
+    async def execute_persisted_turn_from_observation(self, **kwargs):
         self.calls.append(kwargs)
+        self.observations.append(kwargs.get("observation"))
         self.events.append("executor")
         if self.error is not None:
             raise self.error
         return self.result
+
+    async def execute_persisted_turn(self, **kwargs):
+        raise AssertionError(
+            "the application boundary must use the precomputed-observation path"
+        )
 
 
 class _RecordingCatalog:
@@ -643,10 +744,12 @@ def _other_procedure():
     )
 
 
-def _persisted_turn_result(conversation_id="chat-1", revision=1):
+def _persisted_turn_result(
+    conversation_id="chat-1", revision=1, text="step text."
+):
     return PersistedTurnResult(
         conversation_id=conversation_id,
-        turn=object(),
+        turn=SimpleNamespace(assistant_text=text),
         state=ProcedureState(),
         revision=revision,
     )
@@ -668,10 +771,21 @@ class _Harness:
     store: _ReadOnlyStore
     sessions: _RecordingSessionFactory
     executor: _RecordingExecutor
+    analyzer: _RecordingAnalyzer
+    backend: _FakeBackend
+    qa: _FakeQA
     events: list
 
 
-def _harness(catalog, *, stored=None, executor=None) -> _Harness:
+def _harness(
+    catalog,
+    *,
+    stored=None,
+    executor=None,
+    analyzer=None,
+    backend=None,
+    qa=None,
+) -> _Harness:
     events: list[str] = []
     store = _ReadOnlyStore(stored=stored, events=events)
     sessions = _RecordingSessionFactory(events)
@@ -679,16 +793,22 @@ def _harness(catalog, *, stored=None, executor=None) -> _Harness:
         executor = _RecordingExecutor(
             result=_persisted_turn_result(), events=events
         )
+    analyzer = analyzer if analyzer is not None else _RecordingAnalyzer("problem")
+    backend = backend if backend is not None else _FakeBackend()
+    qa = qa if qa is not None else _FakeQA()
     core = sc.SupportCore(
         procedure_catalog=catalog,
-        analyzer_provider="analyzer-provider",
-        knowledge_backend="knowledge-backend",
+        analyzer_provider=analyzer,
+        knowledge_backend=backend,
+        knowledge_qa_provider=qa,
         response_provider="response-provider",
         session_factory=sessions,
         store_factory=lambda session: store,
         turn_executor=executor,
     )
-    return _Harness(core, store, sessions, executor, events)
+    return _Harness(
+        core, store, sessions, executor, analyzer, backend, qa, events
+    )
 
 
 # ------------------------------------------------------------
@@ -713,7 +833,8 @@ async def test_handle_turn_cold_start_uses_the_catalog_and_runs_one_turn():
     assert catalog.select_calls == ["black screen on boot"]
     assert catalog.get_calls == []
 
-    # ONE deferred turn, with the EXACT selected Procedure object.
+    # EXACTLY ONE analysis; ONE deferred turn with the EXACT Procedure.
+    assert h.analyzer.calls == 1
     assert len(h.executor.calls) == 1
     assert h.executor.calls[0]["procedure"] is procedure
     assert len(h.store.reads) == 1  # identity read only; never a write
@@ -732,6 +853,7 @@ async def test_handle_turn_cold_start_without_a_match_returns_no_procedure():
     assert outcome.conversation_id == "chat-1"
     assert outcome.persisted is None
     assert h.executor.calls == []  # no procedure invented, no turn run
+    assert h.analyzer.calls == 1  # analysis STILL happened exactly once
     assert catalog.get_calls == []
 
 
@@ -750,6 +872,7 @@ async def test_handle_turn_cold_start_ambiguity_returns_no_procedure():
     assert outcome.status == sc.NO_PROCEDURE
     assert outcome.persisted is None
     assert h.executor.calls == []  # never a best-match / tie-break guess
+    assert h.analyzer.calls == 1
 
 
 # ------------------------------------------------------------
@@ -816,6 +939,7 @@ async def test_handle_turn_unknown_bound_procedure_is_a_safe_failure():
     assert outcome.status == sc.PROCEDURE_NOT_FOUND
     assert outcome.persisted is None
     assert h.executor.calls == []  # no procedure, no turn
+    assert h.analyzer.calls == 0  # FAIL CLOSED before any analysis
     # Identity was NEVER guessed from the text, even though the text matches.
     assert catalog.select_calls == []
     assert catalog.get_calls == [("GHOST", 1)]
@@ -834,6 +958,7 @@ async def test_handle_turn_wrong_bound_version_never_falls_back_to_latest():
 
     assert outcome.status == sc.PROCEDURE_NOT_FOUND
     assert h.executor.calls == []
+    assert h.analyzer.calls == 0
     assert catalog.select_calls == []
     assert catalog.get_calls == [("BLACK_SCREEN", 99)]
 
@@ -851,6 +976,7 @@ async def test_handle_turn_bound_without_a_version_is_not_guessed():
 
     assert outcome.status == sc.PROCEDURE_NOT_FOUND
     assert h.executor.calls == []
+    assert h.analyzer.calls == 0
     assert catalog.select_calls == []
     assert catalog.get_calls == []  # no version -> not even looked up
 
@@ -874,22 +1000,25 @@ async def test_handle_turn_forwards_the_composed_providers_and_history():
         history=history,
     )
 
+    # The opaque history reaches the analyzer VERBATIM (single-analysis path).
+    assert h.analyzer.calls == 1
+    assert h.analyzer.histories[-1] == history
+    assert "black screen" in h.analyzer.prompts[-1]
+
+    # The executor receives the SAME already-analyzed observation PLUS the
+    # SupportCore-composed knowledge / response providers (no re-analysis).
     call = h.executor.calls[0]
     assert set(call) == {
         "conversation_id",
-        "message",
+        "observation",
         "procedure",
-        "analyzer_provider",
-        "history",
         "knowledge_backend",
         "response_provider",
     }
     assert call["conversation_id"] == "chat-1"
-    assert call["message"] == "black screen"
-    assert call["history"] is history  # opaque pass-through, unchanged
-    assert call["analyzer_provider"] is h.core.analyzer_provider
     assert call["knowledge_backend"] is h.core.knowledge_backend
     assert call["response_provider"] is h.core.response_provider
+    assert h.executor.observations[0] is not None
 
 
 @pytest.mark.asyncio
@@ -948,6 +1077,122 @@ async def test_transaction_boundary_stays_owned_by_the_executor():
     assert h.sessions.opened == 1
 
 
+# ------------------------------------------------------------
+# FAMILY BRANCHES PROJECTED FROM THE DISPATCHER (Slice 11B.2)
+# ------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_information_without_a_procedure_routes_to_knowledge_qa():
+    catalog = _RecordingCatalog(ProcedureCatalog([_procedure()]))
+    h = _harness(
+        catalog,
+        analyzer=_RecordingAnalyzer("information"),
+        backend=_FakeBackend(
+            items=(KnowledgeItem(text="Windows 10 is supported."),)
+        ),
+        qa=_FakeQA('{"answer": "AngioPlus supports Windows 10."}'),
+    )
+
+    outcome = await h.core.handle_turn(
+        conversation_id="chat-1", message="Which Windows versions?"
+    )
+
+    assert outcome.status == sc.KNOWLEDGE_QA
+    assert outcome.conversation_id == "chat-1"
+    assert outcome.knowledge.status is KnowledgeQAStatus.ANSWERED
+    assert outcome.text is None
+    assert h.analyzer.calls == 1  # analysis STILL happened with no candidate
+    assert h.executor.calls == []  # procedure never executed
+    assert h.backend.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_information_while_bound_answers_without_executing_the_procedure():
+    catalog = _RecordingCatalog(ProcedureCatalog([_procedure()]))
+    h = _harness(
+        catalog,
+        stored=_stored_identity("BLACK_SCREEN", 1),
+        analyzer=_RecordingAnalyzer("information"),
+        backend=_FakeBackend(items=(KnowledgeItem(text="Windows support."),)),
+        qa=_FakeQA('{"answer": "Yes."}'),
+    )
+
+    outcome = await h.core.handle_turn(
+        conversation_id="chat-1", message="Which versions are supported?"
+    )
+
+    assert outcome.status == sc.KNOWLEDGE_QA
+    # The bound identity was rehydrated, but the procedure was NOT executed.
+    assert catalog.get_calls == [("BLACK_SCREEN", 1)]
+    assert h.executor.calls == []
+    assert h.store.reads == ["chat-1"]  # identity read only; never a write
+
+
+@pytest.mark.asyncio
+async def test_unclear_turn_returns_clarification_without_a_family_call():
+    catalog = ProcedureCatalog([_procedure()])
+    h = _harness(catalog, analyzer=_RecordingAnalyzer("unclear"))
+
+    outcome = await h.core.handle_turn(
+        conversation_id="chat-1", message="???"
+    )
+
+    assert outcome.status == sc.CLARIFICATION
+    assert outcome.clarification.text.strip()
+    assert h.executor.calls == []
+    assert h.backend.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_analyzer_failure_routes_to_clarification():
+    catalog = ProcedureCatalog([_procedure()])
+    h = _harness(
+        catalog,
+        analyzer=_RecordingAnalyzer("problem", error=RuntimeError("down")),
+    )
+
+    outcome = await h.core.handle_turn(
+        conversation_id="chat-1", message="black screen"
+    )
+
+    assert outcome.status == sc.CLARIFICATION
+    assert h.executor.calls == []
+    assert h.analyzer.calls == 1  # attempted exactly once (fail-safe)
+
+
+@pytest.mark.asyncio
+async def test_human_request_returns_escalate_without_a_family():
+    catalog = ProcedureCatalog([_procedure()])
+    analyzer = _RecordingAnalyzer("problem", human_requested=True)
+    h = _harness(catalog, analyzer=analyzer)
+
+    outcome = await h.core.handle_turn(
+        conversation_id="chat-1", message="connect me to a human"
+    )
+
+    assert outcome.status == sc.ESCALATE
+    assert outcome.text == project_global_terminal(GlobalAction.ESCALATE)
+    assert h.executor.calls == []
+    assert h.backend.calls == 0
+    assert analyzer.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_out_of_scope_returns_out_of_scope_without_a_family():
+    catalog = ProcedureCatalog([_procedure()])
+    analyzer = _RecordingAnalyzer("information", scope="out_of_scope")
+    h = _harness(catalog, analyzer=analyzer)
+
+    outcome = await h.core.handle_turn(
+        conversation_id="chat-1", message="what is the weather?"
+    )
+
+    assert outcome.status == sc.OUT_OF_SCOPE
+    assert outcome.text == project_global_terminal(GlobalAction.OUT_OF_SCOPE)
+    assert h.executor.calls == []
+    assert h.backend.calls == 0
+
+
 def test_support_core_opens_exactly_one_session_and_never_commits():
     tree = _tree()
 
@@ -978,33 +1223,75 @@ def test_support_core_does_not_call_the_orchestrator_or_the_router():
 
 def test_turn_outcome_statuses_are_stable_strings():
     assert sc.TURN_EXECUTED == "TURN_EXECUTED"
+    assert sc.KNOWLEDGE_QA == "KNOWLEDGE_QA"
+    assert sc.CLARIFICATION == "CLARIFICATION"
+    assert sc.ESCALATE == "ESCALATE"
+    assert sc.OUT_OF_SCOPE == "OUT_OF_SCOPE"
     assert sc.NO_PROCEDURE == "NO_PROCEDURE"
     assert sc.PROCEDURE_NOT_FOUND == "PROCEDURE_NOT_FOUND"
-    assert len({sc.TURN_EXECUTED, sc.NO_PROCEDURE, sc.PROCEDURE_NOT_FOUND}) == 3
 
 
-def test_turn_outcome_enforces_its_shape():
+def test_turn_outcome_enforces_exactly_one_payload():
     persisted = _persisted_turn_result()
-
-    done = sc.SupportTurnOutcome(
-        status=sc.TURN_EXECUTED, conversation_id="chat-1", persisted=persisted
+    knowledge = KnowledgeQAResult(
+        status=KnowledgeQAStatus.NOT_ANSWERED, text="neutral"
     )
-    assert done.persisted is persisted
+    clarification = clarify()
 
+    assert (
+        sc.SupportTurnOutcome(
+            status=sc.TURN_EXECUTED,
+            conversation_id="chat-1",
+            persisted=persisted,
+        ).persisted
+        is persisted
+    )
+    assert (
+        sc.SupportTurnOutcome(
+            status=sc.KNOWLEDGE_QA, conversation_id="c", knowledge=knowledge
+        ).knowledge
+        is knowledge
+    )
+    assert (
+        sc.SupportTurnOutcome(
+            status=sc.CLARIFICATION,
+            conversation_id="c",
+            clarification=clarification,
+        ).clarification
+        is clarification
+    )
+    assert (
+        sc.SupportTurnOutcome(
+            status=sc.ESCALATE, conversation_id="c", text="escalate"
+        ).text
+        == "escalate"
+    )
+
+    # No-payload statuses reject ANY payload.
     for failing_status in (sc.NO_PROCEDURE, sc.PROCEDURE_NOT_FOUND):
-        outcome = sc.SupportTurnOutcome(
-            status=failing_status, conversation_id="chat-1"
+        assert (
+            sc.SupportTurnOutcome(
+                status=failing_status, conversation_id="c"
+            ).persisted
+            is None
         )
-        assert outcome.persisted is None
         with pytest.raises(ValueError):
             sc.SupportTurnOutcome(
                 status=failing_status,
-                conversation_id="chat-1",
+                conversation_id="c",
                 persisted=persisted,
             )
 
+    # A payload-bearing status requires EXACTLY its own payload.
     with pytest.raises(ValueError):
-        sc.SupportTurnOutcome(status="TURN_EXECUTED", conversation_id="chat-1")
-
+        sc.SupportTurnOutcome(status=sc.TURN_EXECUTED, conversation_id="c")
     with pytest.raises(ValueError):
-        sc.SupportTurnOutcome(status="handed_off", conversation_id="chat-1")
+        sc.SupportTurnOutcome(
+            status=sc.KNOWLEDGE_QA, conversation_id="c", persisted=persisted
+        )
+    with pytest.raises(ValueError):
+        sc.SupportTurnOutcome(
+            status=sc.ESCALATE, conversation_id="c", text="   "
+        )
+    with pytest.raises(ValueError):
+        sc.SupportTurnOutcome(status="handed_off", conversation_id="c")

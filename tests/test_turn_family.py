@@ -117,10 +117,19 @@ def test_module_imports_only_enum_and_observation():
     assert set(tf.__all__) == {"TurnFamily", "select_turn_family"}
 
 
-def test_selector_is_not_wired_into_runtime():
+def test_selector_is_wired_only_into_the_application_boundary():
     root = Path(tf.__file__).resolve().parents[1]
+
+    # Slice 11B.2: the dispatcher OWNS family selection
+    # (``select_turn_family``); SupportCore references the closed family
+    # vocabulary while projecting the dispatcher's typed results.
+    for rel in ("support/turn_dispatch.py", "support/support_core.py"):
+        text = (root / rel).read_text(encoding="utf-8")
+        assert "turn_family" in text, rel
+        assert "TurnFamily" in text, rel
+
+    # EVERY runtime path stays UNWIRED: this is a later slice.
     for rel in (
-        "support/support_core.py",
         "yandex/chat/server.py",
         "yandex/chat/alice_support_agent.py",
     ):

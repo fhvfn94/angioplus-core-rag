@@ -1,26 +1,32 @@
 """
-Turn Dispatch -- the SINGLE family-dispatch boundary (Slice 11B.1b.4c).
+Turn Dispatch -- the SINGLE family-dispatch boundary (Slice 11B.1b.4c),
+extended in Slice 11B.2 to run GLOBAL SEMANTIC POLICY before family selection.
 
 Infrastructure only. NOT imported by any production runtime path (server.py,
-alice_support_agent.py, the Support Core composition root, n8n, Tracker, DB,
-retrieval, File Search). It is a standalone application service; runtime /
-SupportCore integration and the global semantic-policy owner are LATER slices.
+alice_support_agent.py, n8n, Tracker, DB, retrieval, File Search). Since Slice
+11B.2 it IS composed by the Support Core application boundary
+(``support.support_core``), which owns procedure resolution; runtime / channel
+wiring remains a LATER slice.
 
 WHAT THIS MODULE IS
 -------------------
-ONE incoming support turn is understood ONCE, its processing FAMILY is chosen
-DETERMINISTICALLY, and EXACTLY ONE capability runs:
+ONE incoming support turn is understood ONCE, its GLOBAL terminal gate is
+evaluated, its processing FAMILY is chosen DETERMINISTICALLY, and EXACTLY ONE
+capability runs:
 
     message, state, procedure
       -> analyze_support_turn(...)            (EXACTLY ONE analysis)
       -> SemanticObservation
-      -> select_turn_family(observation)      (the ONLY family decision)
-      -> EXACTLY ONE family branch
-           |- PROCEDURE_SUPPORT -> SupportTurnExecutor
-           |                        .execute_persisted_turn_from_observation
-           |                        (the SAME observation; single CAS writer)
-           |- KNOWLEDGE_QA      -> answer_question(...)
-           |- CLARIFICATION     -> clarify()
+      -> evaluate_global_policy(observation)  (the ONLY global terminal gate)
+           |- ESCALATE / OUT_OF_SCOPE -> project + GlobalTerminalDispatch
+           |- CONTINUE                -> select_turn_family(observation)
+                                         (the ONLY family decision)
+                -> EXACTLY ONE family branch
+                     |- PROCEDURE_SUPPORT -> SupportTurnExecutor
+                     |                        .execute_persisted_turn_from_observation
+                     |                        (the SAME observation; single CAS writer)
+                     |- KNOWLEDGE_QA      -> answer_question(...)
+                     |- CLARIFICATION     -> clarify()
 
 SINGLE-ANALYSIS INVARIANT (non-negotiable)
 ------------------------------------------
@@ -40,13 +46,18 @@ implementation, procedure resolution / selection (the caller supplies the
 already-resolved ``state`` / ``procedure``), HTTP / runtime / channel
 behaviour, FSM / Tracker, message persistence, idempotency.
 
-GLOBAL SEMANTIC POLICY (deliberately NOT here)
-----------------------------------------------
-``human_requested``, ``scope`` and ``problem_status`` are GLOBAL semantic
-gates that the FROZEN router owns today (inside the procedure pipeline). This
-dispatcher does NOT evaluate them and does NOT duplicate that policy. A SINGLE
-owner for those gates is designed in a LATER slice; until then this module
-must NOT be wired into any runtime path.
+GLOBAL SEMANTIC POLICY (wired here -- Slice 11B.2)
+--------------------------------------------------
+Immediately AFTER the ONE analysis and BEFORE family selection, the dispatcher
+asks the SINGLE global owner (:func:`support.global_policy.
+evaluate_global_policy`) whether the turn must TERMINATE before any capability
+runs. A terminal verdict -- ``ESCALATE`` (explicit human request) or
+``OUT_OF_SCOPE`` -- preempts family dispatch and returns a typed
+:class:`GlobalTerminalDispatch`; NO family capability executes. The dispatcher
+does NOT duplicate that policy and does NOT import the legacy Router: the
+EXISTING wording for a terminal is projected by :mod:
+``support.turn_projection`` (the Response Generator stays the single wording
+owner).
 
 NO-PROCEDURE OUTCOME
 --------------------
@@ -81,6 +92,7 @@ from typing import Mapping, Optional, Sequence, Union
 
 from support.alice_analyzer import AnalyzerProvider
 from support.clarification import ClarificationResult, clarify
+from support.global_policy import GlobalAction, evaluate_global_policy
 from support.knowledge import KnowledgeBackend
 from support.knowledge_qa import (
     KnowledgeQAProvider,
@@ -94,10 +106,11 @@ from support.procedure_state import ProcedureState
 from support.response_generator import ResponseProvider
 from support.turn_executor import PersistedTurnResult, SupportTurnExecutor
 from support.turn_family import TurnFamily, select_turn_family
+from support.turn_projection import project_global_terminal
 
 
 # ============================================================
-# DISPATCH RESULT (two thin types, no ``None`` policy signal)
+# DISPATCH RESULT (three thin types, no ``None`` policy signal)
 # ============================================================
 
 @dataclass(frozen=True)
@@ -146,19 +159,49 @@ class ExecutedDispatch:
 
 
 @dataclass(frozen=True)
+class GlobalTerminalDispatch:
+    """A GLOBAL terminal preempted every capability/family -- Slice 11B.2.
+
+    The ONE analysis already ran; Global Semantic Policy then terminated the
+turn BEFORE family selection, so NO family ran, NO procedure executor was
+called and NO ProcedureState was written. ``action`` is the closed
+:class:`~support.global_policy.GlobalAction` verdict (``ESCALATE`` or
+``OUT_OF_SCOPE``) and ``text`` is the EXISTING deterministic wording produced
+by :func:`support.turn_projection.project_global_terminal` (the Response
+Generator stays the single wording owner).
+    """
+
+    action: GlobalAction
+    text: str
+
+    def __post_init__(self) -> None:
+        if self.action not in (
+            GlobalAction.ESCALATE,
+            GlobalAction.OUT_OF_SCOPE,
+        ):
+            raise ValueError(
+                "action must be a global terminal (ESCALATE / OUT_OF_SCOPE)."
+            )
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("text must be a non-blank string.")
+
+
+@dataclass(frozen=True)
 class NoProcedureDispatch:
     """A PROBLEM turn resolved to NO procedure candidate.
 
     NO capability ran: no executor call (there is no ``Procedure``), no
     wording invented, no ``None`` policy signal. It is deliberately NOT the
-    CLARIFICATION family. The application boundary maps it, in a later slice,
-    to its EXISTING ``NO_PROCEDURE`` outcome (nothing persisted). Carries no
-    fields -- a type-level marker.
+    CLARIFICATION family. The application boundary maps it to its EXISTING
+    ``NO_PROCEDURE`` outcome (nothing persisted). Carries no fields -- a
+    type-level marker.
     """
 
 
 # What ``SupportTurnDispatcher.dispatch`` returns.
-DispatchResult = Union[ExecutedDispatch, NoProcedureDispatch]
+DispatchResult = Union[
+    ExecutedDispatch, GlobalTerminalDispatch, NoProcedureDispatch
+]
 
 
 # ============================================================
@@ -217,10 +260,20 @@ class SupportTurnDispatcher:
             analyzer_provider=self._analyzer_provider,
         )
 
-        # 2. The ONLY family decision (reads request_kind alone).
+        # 2. The ONE global terminal gate (reads scope + human_requested),
+        #    BEFORE any capability. A terminal preempts family selection and
+        #    runs no family at all; its EXISTING wording is projected.
+        global_action = evaluate_global_policy(observation)
+        if global_action is not GlobalAction.CONTINUE:
+            return GlobalTerminalDispatch(
+                action=global_action,
+                text=project_global_terminal(global_action),
+            )
+
+        # 3. The ONLY family decision (reads request_kind alone).
         family = select_turn_family(observation)
 
-        # 3. Delegate to EXACTLY ONE family, using the SAME observation.
+        # 4. Delegate to EXACTLY ONE family, using the SAME observation.
         if family is TurnFamily.PROCEDURE_SUPPORT:
             return await self._dispatch_procedure(
                 conversation_id, observation, procedure
@@ -290,6 +343,7 @@ class SupportTurnDispatcher:
 __all__ = [
     "DispatchResult",
     "ExecutedDispatch",
+    "GlobalTerminalDispatch",
     "NoProcedureDispatch",
     "SupportTurnDispatcher",
 ]

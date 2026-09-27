@@ -13,7 +13,8 @@ and recorders exercise the behavioral invariants of
   * a ``ProcedureStateConflict`` propagates unchanged (no retry);
   * knowledge statuses are preserved intact;
   * a PROBLEM turn with no procedure is a typed ``NoProcedureDispatch``;
-  * the module is not wired into any runtime path.
+  * global ESCALATE / OUT_OF_SCOPE terminate BEFORE any family capability;
+  * the module is wired ONLY into the SupportCore application boundary.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import pytest
 
 from support.alice_analyzer import build_allowed_steps, parse_semantic_output
 from support.clarification import clarify
+from support.global_policy import GlobalAction
 from support.knowledge import KnowledgeItem
 from support.knowledge_qa import KnowledgeQAStatus, KnowledgeQAResult
 from support.procedure import load_procedure_from_dict
@@ -33,24 +35,28 @@ from support.procedure_state import ProcedureState
 from support.procedure_state_store import ProcedureStateConflict
 from support.turn_dispatch import (
     ExecutedDispatch,
+    GlobalTerminalDispatch,
     NoProcedureDispatch,
     SupportTurnDispatcher,
 )
 from support.turn_executor import PersistedTurnResult
 from support.turn_family import TurnFamily
+from support.turn_projection import project_global_terminal
 
 
 # ============================================================
 # DOUBLES (no network, no DB)
 # ============================================================
 
-def _obs_json(request_kind: str) -> str:
+def _obs_json(
+    request_kind: str, *, scope: str = "in_scope", human_requested: bool = False
+) -> str:
     return json.dumps(
         {
-            "scope": "in_scope",
+            "scope": scope,
             "reported_actions": [],
             "problem_status": None,
-            "human_requested": False,
+            "human_requested": human_requested,
             "clarification_facts": [],
             "new_issue": None,
             "request_kind": request_kind,
@@ -71,6 +77,18 @@ class _CountingAnalyzer:
         if self._error is not None:
             raise self._error
         return _obs_json(self._request_kind)
+
+
+class _RawAnalyzer:
+    """``AnalyzerProvider`` double returning a fixed JSON payload verbatim."""
+
+    def __init__(self, raw: str) -> None:
+        self._raw = raw
+        self.calls = 0
+
+    def __call__(self, prompt, history=()):
+        self.calls += 1
+        return self._raw
 
 
 class _RecordingExecutor:
@@ -402,13 +420,85 @@ def test_executed_dispatch_enforces_its_shape():
 
 
 # ============================================================
+# GLOBAL TERMINALS (Slice 11B.2)
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_human_request_terminates_as_escalate_without_a_family():
+    analyzer = _RawAnalyzer(_obs_json("problem", human_requested=True))
+    ex, bk, qa = _RecordingExecutor(), _FakeBackend(), _FakeQA()
+
+    result = await _dispatcher(analyzer, executor=ex, backend=bk, qa=qa).dispatch(
+        conversation_id="c1", message="connect me to a human"
+    )
+
+    assert isinstance(result, GlobalTerminalDispatch)
+    assert result.action is GlobalAction.ESCALATE
+    assert result.text == project_global_terminal(GlobalAction.ESCALATE)
+    assert analyzer.calls == 1  # analysis still happened exactly once
+    assert ex.calls == [] and bk.calls == 0 and qa.calls == 0  # no family ran
+
+
+@pytest.mark.asyncio
+async def test_out_of_scope_terminates_without_a_family():
+    analyzer = _RawAnalyzer(_obs_json("problem", scope="out_of_scope"))
+    ex, bk, qa = _RecordingExecutor(), _FakeBackend(), _FakeQA()
+
+    result = await _dispatcher(analyzer, executor=ex, backend=bk, qa=qa).dispatch(
+        conversation_id="c1", message="what is the weather?"
+    )
+
+    assert isinstance(result, GlobalTerminalDispatch)
+    assert result.action is GlobalAction.OUT_OF_SCOPE
+    assert result.text == project_global_terminal(GlobalAction.OUT_OF_SCOPE)
+    assert analyzer.calls == 1
+    assert ex.calls == [] and bk.calls == 0 and qa.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_out_of_scope_preempts_an_information_family():
+    # OUT_OF_SCOPE wins even when request_kind would have selected KNOWLEDGE_QA.
+    analyzer = _RawAnalyzer(_obs_json("information", scope="out_of_scope"))
+    ex, qa = _RecordingExecutor(), _FakeQA()
+    bk = _FakeBackend(items=(KnowledgeItem(text="Evidence."),))
+
+    result = await _dispatcher(analyzer, executor=ex, backend=bk, qa=qa).dispatch(
+        conversation_id="c1", message="weather?"
+    )
+
+    assert isinstance(result, GlobalTerminalDispatch)
+    assert result.action is GlobalAction.OUT_OF_SCOPE
+    assert ex.calls == [] and bk.calls == 0 and qa.calls == 0
+
+
+def test_global_terminal_dispatch_enforces_its_shape():
+    ok = GlobalTerminalDispatch(
+        action=GlobalAction.ESCALATE,
+        text=project_global_terminal(GlobalAction.ESCALATE),
+    )
+    assert ok.text.strip()
+
+    with pytest.raises(ValueError):  # CONTINUE is not a terminal
+        GlobalTerminalDispatch(action=GlobalAction.CONTINUE, text="x")
+    with pytest.raises(ValueError):  # blank text is impossible
+        GlobalTerminalDispatch(action=GlobalAction.ESCALATE, text="   ")
+
+
+# ============================================================
 # NOT WIRED ANYWHERE
 # ============================================================
 
-def test_module_is_not_wired_into_runtime():
+def test_module_is_wired_only_into_the_application_boundary():
     root = Path(__file__).resolve().parents[1]
+
+    # Slice 11B.2: SupportCore (the application boundary) composes the
+    # dispatcher -- the ONLY sanctioned integration point.
+    core = (root / "support/support_core.py").read_text(encoding="utf-8")
+    assert "turn_dispatch" in core
+    assert "SupportTurnDispatcher" in core
+
+    # Every OTHER sibling and EVERY runtime path stays UNWIRED.
     for relative in (
-        "support/support_core.py",
         "support/orchestrator.py",
         "support/turn_executor.py",
         "support/alice_analyzer.py",

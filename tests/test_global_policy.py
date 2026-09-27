@@ -227,12 +227,26 @@ def test_module_imports_only_observation_and_stdlib():
     assert imported == {"__future__", "enum", "support.observation"}
 
 
-def test_module_is_not_wired_into_any_runtime_or_sibling():
+def test_module_is_wired_only_into_the_dispatch_boundary():
     root = Path(__file__).resolve().parents[1]
+
+    # Slice 11B.2: the dispatcher APPLIES global policy (after the ONE
+    # analysis, before family selection); SupportCore references the closed
+    # action vocabulary while projecting the dispatcher's typed results. These
+    # are the ONLY two sanctioned, non-runtime integration points.
+    dispatch = (root / "support/turn_dispatch.py").read_text(encoding="utf-8")
+    assert "global_policy" in dispatch
+    assert "GlobalAction" in dispatch
+    assert "evaluate_global_policy" in dispatch
+
+    core = (root / "support/support_core.py").read_text(encoding="utf-8")
+    assert "GlobalAction" in core
+
+    # Procedure-family siblings, the legacy Router and EVERY runtime path stay
+    # UNWIRED: the legacy Router gates 1-2 are retired only when the legacy
+    # ``execute_persisted_turn`` / ``process_support_turn`` path is retired.
     for relative in (
         "support/router.py",
-        "support/turn_dispatch.py",
-        "support/support_core.py",
         "support/orchestrator.py",
         "support/turn_executor.py",
         "support/turn_family.py",

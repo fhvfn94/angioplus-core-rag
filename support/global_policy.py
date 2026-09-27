@@ -3,8 +3,9 @@ Global Semantic Policy -- the ONE owner of the UNIVERSAL terminal conditions
 (Slice 11B.1b.4d).
 
 Infrastructure only. NOT imported by any production runtime path (server.py,
-alice_support_agent.py, the Support Core composition root, n8n, Tracker, DB,
-retrieval, File Search) and NOT wired into the dispatcher yet.
+alice_support_agent.py, n8n, Tracker, DB, retrieval, File Search). Since Slice
+11B.2 it IS applied by the dispatcher (``support.turn_dispatch``) AFTER the
+ONE analysis and BEFORE family selection; it is NOT wired into any runtime.
 
 WHAT THIS MODULE IS
 -------------------
@@ -59,21 +60,23 @@ select_turn_family` (a terminal preempts capability choice); it is NOT part
 of the family selector and does NOT know about families. The Router keeps
 gate 3+ (procedure-specific policy, e.g. ``RESOLVED`` -> RESOLVE).
 
-TRANSITIONAL NOTE (NOT wired here)
-----------------------------------
-The frozen Router still owns its gates 1-2. This module is deliberately NOT
-imported anywhere yet, so there is NO runtime double-ownership: the router
-gates 1-2 are removed ATOMICALLY with dispatcher activation in Slice 11B.2.
-``support/router.py`` and ``support/turn_dispatch.py`` are UNCHANGED here.
+TRANSITIONAL NOTE (legacy Router gates 1-2)
+-------------------------------------------
+The frozen Router still owns its OWN gates 1-2 for the LEGACY procedure path
+(``process_support_turn`` / ``execute_persisted_turn``). On the NEW path the
+dispatcher applies this module's GLOBAL policy BEFORE family selection, so the
+two universal facts (``scope`` / ``human_requested``) have ONE owner there.
+Removing the duplicated legacy gates is deliberately DEFERRED until the legacy
+path is retired: ``support/router.py`` is UNCHANGED in Slice 11B.2.
 
-OPEN QUESTION -- DEFERRED TO 11B.2 (do not resolve here)
-------------------------------------------------------
-``RESOLVED`` + ``procedure is None``: today the Router resolves such a turn
-even with no procedure (gate 3 fires before gate 4). Once a dispatcher routes
-``request_kind=PROBLEM`` with ``procedure=None`` to ``NoProcedureDispatch``,
-that resolution would no longer happen. This is a PROCEDURE-family
-integration concern and is intentionally NOT decided by global policy (which
-ignores ``problem_status`` entirely). It MUST be resolved in Slice 11B.2.
+RESOLVED + procedure is None (Slice 11B.2 decision)
+---------------------------------------------------
+Global policy ignores ``problem_status`` entirely, so it never resolves such a
+turn. On the new path a ``request_kind=PROBLEM`` turn with ``procedure=None``
+returns ``NoProcedureDispatch`` (-> ``NO_PROCEDURE``) and does NOT import the
+legacy Router to resolve it; the ``RESOLVED`` + no-procedure lifecycle /
+acknowledgement case is DEFERRED (NOT solved by importing the legacy Router).
+An ``INFORMATION`` turn with ``procedure=None`` still reaches Knowledge QA.
 """
 
 from __future__ import annotations

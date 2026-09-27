@@ -74,11 +74,22 @@ def test_module_has_no_external_dependency():
     assert set(cl.__all__) == {"ClarificationResult", "clarify"}
 
 
-def test_responder_is_not_wired_into_runtime():
+def test_responder_is_wired_only_into_the_application_boundary():
     root = Path(cl.__file__).resolve().parents[1]
+
+    # Slice 11B.2: the dispatcher CALLS ``clarify()``; SupportCore references
+    # the result type while projecting the CLARIFICATION family outcome.
+    dispatch = (root / "support/turn_dispatch.py").read_text(encoding="utf-8")
+    assert "support.clarification" in dispatch
+    assert "ClarificationResult" in dispatch
+
+    core = (root / "support/support_core.py").read_text(encoding="utf-8")
+    assert "support.clarification" in core
+    assert "ClarificationResult" in core
+
+    # Procedure-family siblings and EVERY runtime path stay UNWIRED.
     for rel in (
         "support/turn_family.py",
-        "support/support_core.py",
         "support/orchestrator.py",
         "support/turn_executor.py",
         "support/router.py",

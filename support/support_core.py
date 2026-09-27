@@ -16,6 +16,9 @@ together, and the single place where ONE support turn is driven end to end.
                      -> PROCEDURE_SUPPORT -> SupportTurnExecutor
                      |                       .execute_persisted_turn_from_observation
                      |                       (persisted; the single CAS writer)
+                     |                       -> ExecutedDispatch (a NEW turn ran)
+                     |                       -> ReplayedDispatch (HL-2b replay: the
+                     |                          persisted winner, NO new text)
                      -> KNOWLEDGE_QA      -> KnowledgeQAResult
                      -> CLARIFICATION     -> ClarificationResult
                      -> (PROBLEM + no candidate) -> NoProcedureDispatch
@@ -65,6 +68,21 @@ CONCURRENCY
   :class:`~support.procedure_state_store.ProcedureStateConflict`, propagated
   UNCHANGED: no automatic retry, no provider re-run, no overwrite of newer
   state, and no duplicate outcome vocabulary invented here.
+
+IDEMPOTENT REPLAY (HL-2c.1)
+---------------------------
+  ``handle_turn`` accepts an OPTIONAL, OPAQUE ``execution_id`` and forwards it
+  UNCHANGED to the dispatcher (and on to the executor); it is never parsed,
+  normalised, hashed, generated, truncated, combined, derived or inferred from
+  the conversation / message / history, and it is never STORED on this
+  boundary. When the executor reports an HL-2b idempotent REPLAY, the
+  dispatcher returns its typed
+  :class:`~support.turn_dispatch.ReplayedDispatch` and this boundary projects
+  it onto the EXISTING ``TURN_EXECUTED`` status carrying the ACTUALLY persisted
+  :class:`~support.turn_executor.PersistedTurnResult` (``replayed`` ``True``,
+  ``turn`` ``None``). NO new status is invented and NO user-facing wording is
+  produced for a replay: this boundary never re-renders, guesses or fabricates
+  assistant text.
 
 :class:`SupportCore` itself remains an injectable, side-effect-free
 container:
@@ -138,6 +156,7 @@ from support.turn_dispatch import (
     ExecutedDispatch,
     GlobalTerminalDispatch,
     NoProcedureDispatch,
+    ReplayedDispatch,
     SupportTurnDispatcher,
 )
 from support.turn_executor import PersistedTurnResult, SupportTurnExecutor
@@ -415,6 +434,7 @@ class SupportCore:
         conversation_id: str,
         message: str,
         history: Sequence[Mapping[str, str]] = (),
+        execution_id: Optional[str] = None,
     ) -> SupportTurnOutcome:
         """Resolve the candidate Procedure, then dispatch ONE support turn.
 
@@ -438,6 +458,16 @@ class SupportCore:
         analyzer and never calls the orchestrator / router.
 
         ``history`` is an opaque pass-through: it is forwarded unchanged.
+
+        ``execution_id`` is an OPTIONAL, OPAQUE idempotency identity (HL-2c.1).
+        It is forwarded UNCHANGED to the dispatcher, which forwards it to the
+        procedure executor ONLY. It is never parsed, normalised, hashed,
+        generated, truncated, combined, derived, semantically validated or
+        inferred from ``conversation_id`` / ``message`` / ``history``, and it is
+        never STORED on this boundary. Omitting it preserves the exact legacy
+        behaviour and the exact legacy downstream call shape. A repeated id
+        therefore yields a replayed (NOT recomputed, NOT re-worded)
+        ``TURN_EXECUTED`` outcome carrying the persisted winner.
 
         Returns a :class:`SupportTurnOutcome`. Raises
         :class:`~support.procedure_state_store.ProcedureStateConflict`
@@ -476,6 +506,7 @@ class SupportCore:
             history=history,
             state=state,
             procedure=procedure,
+            execution_id=execution_id,
         )
         return self._project_outcome(conversation_id, result)
 
@@ -497,6 +528,17 @@ class SupportCore:
                 ),
                 conversation_id=conversation_id,
                 text=result.text,
+            )
+        if isinstance(result, ReplayedDispatch):
+            # HL-2b idempotent replay: the durable state was ALREADY advanced
+            # under this execution id, so NOTHING was recomputed and NO new
+            # user-facing text exists. The EXISTING TURN_EXECUTED vocabulary is
+            # reused with the ACTUALLY persisted winner projected VERBATIM;
+            # no wording and no new status are invented here.
+            return SupportTurnOutcome(
+                status=TURN_EXECUTED,
+                conversation_id=conversation_id,
+                persisted=result.procedure_result,
             )
         if isinstance(result, ExecutedDispatch):
             # Exactly one family capability ran; the family-native payload is

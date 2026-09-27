@@ -25,7 +25,10 @@ Cross-cutting invariants asserted by the scenarios below:
     CAS path (never by SupportCore), so knowledge / clarification / terminal /
     no-procedure turns write NOTHING;
   * BOUND IDENTITY -- a bound conversation reuses the EXACT persisted
-    (procedure_id, procedure_version) pair, never silently switching.
+    (procedure_id, procedure_version) pair, never silently switching;
+  * IDEMPOTENT REPLAY -- repeating the SAME opaque execution id never
+    advances the durable state twice, never writes twice and never re-words
+    a replayed turn (HL-2c.1).
 
 DEFERRED (documented, NOT exercised here): the RESOLVED + procedure=None
 lifecycle stays deferred -- this slice invents no behaviour for it.
@@ -66,11 +69,14 @@ class _InMemoryDB:
     """The shared state of one pretend database.
 
     ``states`` maps a conversation id to ``(ProcedureState, revision)``.
-    Counters make the persistence invariants observable.
+    ``execution_ids`` maps a conversation id to the OPAQUE idempotency id of
+    its LAST write (HL-2b), so a repeated id can be recognised. Counters make
+    the persistence invariants observable.
     """
 
     def __init__(self) -> None:
         self.states: dict[str, tuple[ProcedureState, int]] = {}
+        self.execution_ids: dict[str, Optional[str]] = {}
         self.read_calls = 0
         self.write_attempts = 0
         self.commits = 0
@@ -113,7 +119,11 @@ class _InMemoryStore:
         if entry is None:
             return None
         state, revision = entry
-        return PersistedProcedureState(state=state, revision=revision)
+        return PersistedProcedureState(
+            state=state,
+            revision=revision,
+            last_execution_id=self._db.execution_ids.get(conversation_id),
+        )
 
     async def save_cas(
         self,
@@ -121,16 +131,30 @@ class _InMemoryStore:
         state: ProcedureState,
         *,
         expected_revision: Optional[int],
-    ) -> int:
+        execution_id: Optional[str] = None,
+    ) -> CasResult:
         self._db.write_attempts += 1
         self._db.journal.append(
-            ("save_cas", conversation_id, expected_revision)
+            ("save_cas", conversation_id, expected_revision, execution_id)
         )
         if self._db.raise_on_write:
             # A concurrent writer won the race; the store refuses to write.
             raise ProcedureStateConflict(
                 f"procedure state for {conversation_id!r} raced"
             )
+
+        # HL-2b: one execution id advances the state AT MOST ONCE. A CAS that
+        # loses to the SAME id is an IDEMPOTENT NO-OP that returns the
+        # persisted winner (never a second advance, never an overwrite).
+        if (
+            execution_id is not None
+            and self._db.execution_ids.get(conversation_id) == execution_id
+        ):
+            winner_state, winner_revision = self._db.states[conversation_id]
+            return CasResult(
+                revision=winner_revision, applied=False, state=winner_state
+            )
+
         entry = self._db.states.get(conversation_id)
         if expected_revision is None:
             if entry is not None:
@@ -141,6 +165,7 @@ class _InMemoryStore:
                 raise ProcedureStateConflict("stale revision")
             new_revision = expected_revision + 1
         self._db.states[conversation_id] = (state, new_revision)
+        self._db.execution_ids[conversation_id] = execution_id
         return CasResult(revision=new_revision, applied=True, state=state)
 
 
@@ -764,3 +789,184 @@ async def test_knowledge_qa_infrastructure_failure_is_internal_error():
     assert outcome.status == sc.KNOWLEDGE_QA
     assert outcome.knowledge.status is KnowledgeQAStatus.INTERNAL_ERROR
     assert h.db.write_attempts == 0
+
+
+# ============================================================
+# 11. IDEMPOTENT REPLAY -- the SAME execution id (HL-2c.1)
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_same_execution_id_replay_does_not_advance_or_reword():
+    catalog = _recording_catalog()
+    h = _build(catalog, analyzer=_RecordingAnalyzer("problem"))
+    execution_id = "evt-opaque-123"
+
+    first = await h.core.handle_turn(
+        conversation_id="chat-1",
+        message="black screen on boot",
+        execution_id=execution_id,
+    )
+
+    # FIRST CALL: a NORMAL, newly executed turn.
+    assert first.status == sc.TURN_EXECUTED
+    assert first.persisted.replayed is False
+    assert first.persisted.turn is not None
+    assert first.persisted.turn.assistant_text.strip()
+    assert first.persisted.revision == COLD_START_REVISION
+
+    # Exactly ONE CAS write, and the OPAQUE id was recorded WITH the state.
+    assert h.db.write_attempts == 1
+    assert h.db.commits == 1
+    assert h.db.execution_ids["chat-1"] == execution_id
+    winner_state, winner_revision = h.db.states["chat-1"]
+
+    # SECOND CALL: the SAME execution id -> a legitimate HL-2b replay.
+    second = await h.core.handle_turn(
+        conversation_id="chat-1",
+        message="black screen on boot",
+        execution_id=execution_id,
+    )
+
+    # SupportCore did NOT crash and reused the EXISTING outcome vocabulary.
+    assert second.status == sc.TURN_EXECUTED
+    assert second.conversation_id == "chat-1"
+
+    # The replay carries the persisted WINNER, not a recomputed candidate.
+    assert second.persisted.replayed is True
+    assert second.persisted.turn is None
+    assert second.persisted.state is winner_state
+    assert second.persisted.revision == winner_revision
+
+    # NO second advancement, NO second write, NO second transaction.
+    assert h.db.write_attempts == 1
+    assert h.db.commits == 1
+    assert h.db.states["chat-1"] == (winner_state, winner_revision)
+
+    # NOTHING was fabricated to represent the replay.
+    assert second.text is None
+    assert second.knowledge is None
+    assert second.clarification is None
+
+    # Two SupportCore calls -> exactly two analyses: the replay is detected
+    # INSIDE the executor, i.e. AFTER the ONE analysis that names the family
+    # (runtime-level finalized replay will later short-circuit ABOVE SupportCore).
+    assert h.analyzer.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_a_different_execution_id_is_a_new_turn_not_a_replay():
+    h = _build(_recording_catalog(), analyzer=_RecordingAnalyzer("problem"))
+
+    first = await h.core.handle_turn(
+        conversation_id="chat-1",
+        message="black screen on boot",
+        execution_id="evt-1",
+    )
+    second = await h.core.handle_turn(
+        conversation_id="chat-1",
+        message="black screen on boot",
+        execution_id="evt-2",
+    )
+
+    # A DIFFERENT id is NOT idempotent: the durable state advanced again.
+    assert first.persisted.replayed is False
+    assert second.persisted.replayed is False
+    assert second.persisted.turn is not None
+    assert second.persisted.revision == first.persisted.revision + 1
+    assert h.db.write_attempts == 2
+    assert h.db.execution_ids["chat-1"] == "evt-2"
+
+
+@pytest.mark.asyncio
+async def test_omitting_the_execution_id_keeps_the_legacy_flow():
+    h = _build(_recording_catalog(), analyzer=_RecordingAnalyzer("problem"))
+
+    outcome = await h.core.handle_turn(
+        conversation_id="chat-1", message="black screen on boot"
+    )
+
+    assert outcome.status == sc.TURN_EXECUTED
+    assert outcome.persisted.replayed is False
+    assert outcome.persisted.turn is not None
+    # No id was EVER recorded: a non-idempotent caller stays non-idempotent.
+    assert h.db.execution_ids["chat-1"] is None
+    assert h.db.write_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_execution_id_is_inert_on_every_non_procedure_family():
+    # KNOWLEDGE_QA: the id must NOT create a write / executor call / change.
+    h = _build(
+        analyzer=_RecordingAnalyzer("information"),
+        backend=_FakeBackend(items=(KnowledgeItem(text="Windows support."),)),
+        qa=_FakeQA('{"answer": "Yes."}'),
+    )
+    knowledge = await h.core.handle_turn(
+        conversation_id="chat-1",
+        message="Which Windows versions are supported?",
+        execution_id="evt-opaque-123",
+    )
+    assert knowledge.status == sc.KNOWLEDGE_QA
+    assert knowledge.knowledge.status is KnowledgeQAStatus.ANSWERED
+    assert h.db.write_attempts == 0
+    assert h.db.execution_ids == {}
+    assert h.analyzer.calls == 1
+
+    # GLOBAL ESCALATE: inert.
+    h2 = _build(analyzer=_RecordingAnalyzer("problem", human_requested=True))
+    escalated = await h2.core.handle_turn(
+        conversation_id="chat-1",
+        message="connect me to a human",
+        execution_id="evt-opaque-123",
+    )
+    assert escalated.status == sc.ESCALATE
+    assert h2.db.write_attempts == 0
+    assert h2.db.execution_ids == {}
+
+    # CLARIFICATION: inert.
+    h3 = _build(analyzer=_RecordingAnalyzer("unclear"))
+    clarified = await h3.core.handle_turn(
+        conversation_id="chat-1",
+        message="???",
+        execution_id="evt-opaque-123",
+    )
+    assert clarified.status == sc.CLARIFICATION
+    assert h3.db.write_attempts == 0
+    assert h3.db.execution_ids == {}
+
+    # OUT_OF_SCOPE: inert.
+    h4 = _build(
+        analyzer=_RecordingAnalyzer("information", scope="out_of_scope")
+    )
+    declined = await h4.core.handle_turn(
+        conversation_id="chat-1",
+        message="what is the weather today?",
+        execution_id="evt-opaque-123",
+    )
+    assert declined.status == sc.OUT_OF_SCOPE
+    assert h4.db.write_attempts == 0
+    assert h4.db.execution_ids == {}
+
+    # PROBLEM + no candidate (NO_PROCEDURE): inert.
+    h5 = _build(_recording_catalog(), analyzer=_RecordingAnalyzer("problem"))
+    no_proc = await h5.core.handle_turn(
+        conversation_id="chat-1",
+        message="my coffee machine is broken",
+        execution_id="evt-opaque-123",
+    )
+    assert no_proc.status == sc.NO_PROCEDURE
+    assert h5.db.write_attempts == 0
+    assert h5.db.execution_ids == {}
+
+    # PROCEDURE_NOT_FOUND: inert (fail closed BEFORE any analysis).
+    h6 = _build(_recording_catalog(), analyzer=_RecordingAnalyzer("problem"))
+    _seed_bound(h6.db, "chat-1", "GHOST", 1, revision=3)
+    not_found = await h6.core.handle_turn(
+        conversation_id="chat-1",
+        message="black screen",
+        execution_id="evt-opaque-123",
+    )
+    assert not_found.status == sc.PROCEDURE_NOT_FOUND
+    assert h6.analyzer.calls == 0
+    assert h6.db.write_attempts == 0
+    assert h6.db.execution_ids == {}

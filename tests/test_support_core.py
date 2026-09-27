@@ -1036,6 +1036,70 @@ async def test_handle_turn_returns_the_executors_result_verbatim():
 
 
 # ------------------------------------------------------------
+# IDEMPOTENCY PLUMBING + REPLAY PROJECTION (HL-2c.1)
+# ------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_handle_turn_forwards_the_opaque_execution_id_verbatim():
+    h = _harness(ProcedureCatalog([_procedure()]))
+
+    await h.core.handle_turn(
+        conversation_id="chat-1",
+        message="black screen",
+        execution_id="evt-opaque-123",
+    )
+
+    call = h.executor.calls[0]
+    assert call["execution_id"] == "evt-opaque-123"  # exact, unmodified
+    assert set(call) == {
+        "conversation_id",
+        "observation",
+        "procedure",
+        "knowledge_backend",
+        "response_provider",
+        "execution_id",
+    }
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_omitting_execution_id_keeps_the_legacy_call_shape():
+    h = _harness(ProcedureCatalog([_procedure()]))
+
+    await h.core.handle_turn(conversation_id="chat-1", message="black screen")
+
+    # The keyword is ABSENT (not ``None``): the pre-HL-2c.1 call shape.
+    assert "execution_id" not in h.executor.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_projects_an_idempotent_replay_without_new_wording():
+    winner = ProcedureState(last_recommended_step="STEP_A")
+    replayed = PersistedTurnResult(
+        conversation_id="chat-1",
+        turn=None,
+        state=winner,
+        revision=4,
+        replayed=True,
+    )
+    executor = _RecordingExecutor(result=replayed)
+    h = _harness(ProcedureCatalog([_procedure()]), executor=executor)
+
+    outcome = await h.core.handle_turn(
+        conversation_id="chat-1",
+        message="black screen",
+        execution_id="evt-opaque-123",
+    )
+
+    assert outcome.status == sc.TURN_EXECUTED       # EXISTING vocabulary
+    assert outcome.persisted is replayed            # the winner, VERBATIM
+    assert outcome.persisted.replayed is True
+    assert outcome.persisted.turn is None
+    assert outcome.persisted.state is winner
+    assert outcome.text is None                     # NO fabricated wording
+    assert outcome.knowledge is None and outcome.clarification is None
+
+
+# ------------------------------------------------------------
 # CONFLICT: no retry, no overwrite, no new vocabulary
 # ------------------------------------------------------------
 

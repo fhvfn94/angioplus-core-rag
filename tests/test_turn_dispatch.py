@@ -37,6 +37,7 @@ from support.turn_dispatch import (
     ExecutedDispatch,
     GlobalTerminalDispatch,
     NoProcedureDispatch,
+    ReplayedDispatch,
     SupportTurnDispatcher,
 )
 from support.turn_executor import PersistedTurnResult
@@ -124,6 +125,51 @@ class _RecordingExecutor:
         )
 
 
+# A private sentinel lets a test tell "the keyword was OMITTED" apart from
+# "the keyword was passed None" WITHOUT weakening a double to ``**kwargs``.
+_ABSENT = object()
+
+
+class _ExecutionIdRecordingExecutor:
+    """Strict-signature double that records ``execution_id`` EXACTLY.
+
+    ``execution_id`` defaults to ``_ABSENT``, so the tests can prove the
+    dispatcher OMITS the keyword entirely for a non-idempotent caller (rather
+    than passing ``execution_id=None``) -- the established HL-2b call shape.
+    """
+
+    def __init__(self, result=None) -> None:
+        self._result = result
+        self.calls: list[dict] = []
+        self.execution_ids: list = []
+
+    async def execute_persisted_turn_from_observation(
+        self,
+        *,
+        conversation_id,
+        observation,
+        procedure,
+        knowledge_backend=None,
+        response_provider=None,
+        execution_id=_ABSENT,
+    ):
+        self.calls.append(
+            {
+                "conversation_id": conversation_id,
+                "procedure": procedure,
+                "knowledge_backend": knowledge_backend,
+                "response_provider": response_provider,
+            }
+        )
+        self.execution_ids.append(execution_id)
+        return self._result if self._result is not None else _persisted()
+
+    async def execute_persisted_turn(self, **kwargs):
+        raise AssertionError(
+            "the dispatcher must use the precomputed-observation path only"
+        )
+
+
 class _FakeBackend:
     """``KnowledgeBackend`` double."""
 
@@ -161,6 +207,22 @@ def _persisted(text: str = "Step text.", revision: int = 1):
         turn=SimpleNamespace(assistant_text=text),
         state=ProcedureState(),
         revision=revision,
+    )
+
+
+def _replayed(*, revision: int = 3, state=None):
+    """The EXACT typed result HL-2b returns for an IDEMPOTENT HIT.
+
+    BOTH idempotent paths -- BEFORE PROCESS and AFTER losing the CAS race --
+    produce this same shape (``turn`` is ``None``, ``state`` is the persisted
+    winner), so the dispatcher must not care which one happened.
+    """
+    return PersistedTurnResult(
+        conversation_id="c1",
+        turn=None,
+        state=state if state is not None else ProcedureState(),
+        revision=revision,
+        replayed=True,
     )
 
 
@@ -385,6 +447,115 @@ async def test_problem_without_a_procedure_returns_no_procedure():
     assert executor.calls == []  # never run without a Procedure
     assert backend.calls == 0 and qa.calls == 0  # not re-classified
     assert analyzer.calls == 1  # analysis still happened exactly once
+
+
+# ============================================================
+# PROCEDURE REPLAY (HL-2c.1)
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_idempotent_hit_returns_a_typed_replayed_dispatch():
+    # The SAME typed executor result comes from BOTH idempotent paths (the
+    # BEFORE-PROCESS hit and the POST-CAS race); the dispatcher must not care
+    # which one produced it.
+    winner = ProcedureState(last_recommended_step="STEP_A")
+    executor = _RecordingExecutor(result=_replayed(revision=3, state=winner))
+
+    result = await _dispatcher(
+        _CountingAnalyzer("problem"), executor=executor
+    ).dispatch(conversation_id="c1", message="black screen", procedure=_procedure())
+
+    assert isinstance(result, ReplayedDispatch)
+    assert not isinstance(result, ExecutedDispatch)
+    assert result.family is TurnFamily.PROCEDURE_SUPPORT
+    assert result.procedure_result is executor._result
+    assert result.procedure_result.replayed is True
+    assert result.procedure_result.turn is None
+    assert result.procedure_result.state is winner
+    # NO text field at all: a replay never fabricates a user-facing answer.
+    assert not hasattr(result, "text")
+
+
+def test_replayed_dispatch_enforces_its_shape():
+    ok = ReplayedDispatch(
+        family=TurnFamily.PROCEDURE_SUPPORT, procedure_result=_replayed()
+    )
+    assert ok.procedure_result.turn is None
+
+    with pytest.raises(ValueError):  # only a PROCEDURE_SUPPORT replay exists
+        ReplayedDispatch(
+            family=TurnFamily.CLARIFICATION, procedure_result=_replayed()
+        )
+    with pytest.raises(ValueError):  # a NON-replay is an ExecutedDispatch
+        ReplayedDispatch(
+            family=TurnFamily.PROCEDURE_SUPPORT, procedure_result=_persisted()
+        )
+    with pytest.raises(ValueError):  # must carry the persisted result
+        ReplayedDispatch(
+            family=TurnFamily.PROCEDURE_SUPPORT, procedure_result="nope"
+        )
+
+
+@pytest.mark.asyncio
+async def test_execution_id_is_forwarded_verbatim_and_omitted_when_absent():
+    executor = _ExecutionIdRecordingExecutor()
+    dispatcher = _dispatcher(_CountingAnalyzer("problem"), executor=executor)
+
+    await dispatcher.dispatch(
+        conversation_id="c1",
+        message="m",
+        procedure=_procedure(),
+        execution_id="evt-opaque-123",
+    )
+    assert executor.execution_ids == ["evt-opaque-123"]  # exact, unchanged
+
+    # Omitting it preserves the EXACT legacy call shape: the keyword is
+    # ABSENT (not ``None``), so strict downstream doubles keep working.
+    other = _ExecutionIdRecordingExecutor()
+    await _dispatcher(_CountingAnalyzer("problem"), executor=other).dispatch(
+        conversation_id="c1", message="m", procedure=_procedure()
+    )
+    assert other.execution_ids == [_ABSENT]
+
+
+@pytest.mark.asyncio
+async def test_execution_id_never_reaches_non_procedure_families():
+    executor = _ExecutionIdRecordingExecutor()
+    backend = _FakeBackend(items=(KnowledgeItem(text="Evidence."),))
+    qa = _FakeQA('{"answer": "A."}')
+
+    knowledge = await _dispatcher(
+        _CountingAnalyzer("information"), executor=executor, backend=backend, qa=qa
+    ).dispatch(conversation_id="c1", message="q", execution_id="evt-opaque-123")
+
+    clarification = await _dispatcher(
+        _CountingAnalyzer("unclear"), executor=executor
+    ).dispatch(conversation_id="c1", message="???", execution_id="evt-opaque-123")
+
+    terminal = await _dispatcher(
+        _RawAnalyzer(_obs_json("problem", human_requested=True)), executor=executor
+    ).dispatch(conversation_id="c1", message="human", execution_id="evt-opaque-123")
+
+    no_procedure = await _dispatcher(
+        _CountingAnalyzer("problem"), executor=executor
+    ).dispatch(
+        conversation_id="c1",
+        message="m",
+        procedure=None,
+        execution_id="evt-opaque-123",
+    )
+
+    assert isinstance(knowledge, ExecutedDispatch)
+    assert knowledge.family is TurnFamily.KNOWLEDGE_QA
+    assert isinstance(clarification, ExecutedDispatch)
+    assert clarification.family is TurnFamily.CLARIFICATION
+    assert isinstance(terminal, GlobalTerminalDispatch)
+    assert isinstance(no_procedure, NoProcedureDispatch)
+
+    # The procedure executor NEVER ran: the id cannot leak into another family.
+    assert executor.calls == []
+    assert backend.calls == 1
+    assert qa.calls == 1
 
 
 # ============================================================

@@ -320,6 +320,19 @@ class ProcedureStateRow(Base):
         Integer, nullable=False, server_default=text("1")
     )
 
+    # --- per-turn idempotency identity (HL-2b) ---
+    # An OPAQUE execution id recorded on the LAST CAS write, written
+    # atomically with the state (same UPDATE / INSERT). It carries NO
+    # channel or runtime meaning: the store never interprets it, and a
+    # caller that supplies none leaves it NULL (so callers that do not use
+    # idempotency are entirely unaffected). The store uses it ONLY to make
+    # a repeated write of the SAME execution id an idempotent no-op -- no
+    # second revision bump, no attempt-log rewrite. GLOBALLY UNIQUE (see
+    # __table_args__) so ONE execution can advance at most ONE
+    # conversation's state. Not part of the frozen ``ProcedureState`` value
+    # object; a persistence concern like ``revision``.
+    last_execution_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -342,6 +355,14 @@ class ProcedureStateRow(Base):
         CheckConstraint(
             "revision >= 1",
             name="ck_procedure_states_revision",
+        ),
+        # Globally unique: one execution id advances at most one state row.
+        # NULLs are distinct in PostgreSQL, so any number of non-idempotent
+        # writers may leave ``last_execution_id`` NULL.
+        Index(
+            "uq_procedure_states_last_execution_id",
+            "last_execution_id",
+            unique=True,
         ),
     )
 

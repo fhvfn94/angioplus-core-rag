@@ -122,12 +122,14 @@ async def test_cold_start_insert_sets_revision_one(session_factory):
     cid = await _make_conversation(session_factory)
 
     async with session_factory() as session:
-        revision = await ProcedureStateStore(session).save_cas(
+        result = await ProcedureStateStore(session).save_cas(
             cid, _state_a(), expected_revision=None
         )
         await session.commit()
 
-    assert revision == 1
+    assert result.applied is True
+    assert result.revision == 1
+    assert result.state == _state_a()
     async with session_factory() as check:
         stored = await ProcedureStateStore(check).read(cid)
     assert stored is not None
@@ -148,12 +150,13 @@ async def test_cas_update_increments_revision_and_round_trips(session_factory):
         await session.commit()
 
     async with session_factory() as session:
-        revision = await ProcedureStateStore(session).save_cas(
+        result = await ProcedureStateStore(session).save_cas(
             cid, _state_b(), expected_revision=1
         )
         await session.commit()
 
-    assert revision == 2
+    assert result.applied is True
+    assert result.revision == 2
     async with session_factory() as check:
         stored = await ProcedureStateStore(check).read(cid)
     assert stored.revision == 2
@@ -206,11 +209,11 @@ async def test_simultaneous_cold_start_creates_single_row(session_factory):
     async def writer():
         async with session_factory() as session:
             try:
-                revision = await ProcedureStateStore(session).save_cas(
+                result = await ProcedureStateStore(session).save_cas(
                     cid, _state_a(), expected_revision=None
                 )
                 await session.commit()
-                return revision
+                return result.revision
             except ProcedureStateConflict:
                 await session.rollback()
                 return "conflict"
@@ -279,11 +282,12 @@ async def test_frozen_service_write_lands_at_revision_one(session_factory):
 
     # ...and the CAS can continue from that row on the SAME model.
     async with session_factory() as session:
-        revision = await ProcedureStateStore(session).save_cas(
+        result = await ProcedureStateStore(session).save_cas(
             cid, _state_b(), expected_revision=1
         )
         await session.commit()
-    assert revision == 2
+    assert result.applied is True
+    assert result.revision == 2
 
 
 async def test_revision_below_one_rejected_by_check(session_factory):

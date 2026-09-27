@@ -32,6 +32,7 @@ from support.observation import (
 from support.procedure import load_procedure
 from support.procedure_state import ProcedureState
 from support.procedure_state_store import (
+    CasResult,
     PersistedProcedureState,
     ProcedureStateConflict,
 )
@@ -76,7 +77,7 @@ class _FakeStore:
 
     async def save_cas(
         self, conversation_id: str, state: ProcedureState, *, expected_revision
-    ) -> int:
+    ) -> CasResult:
         self._db.save_cas_calls += 1
         current = self._db.rows.get(conversation_id)
         current_rev = current.revision if current is not None else 0
@@ -88,7 +89,7 @@ class _FakeStore:
         self._db.rows[conversation_id] = PersistedProcedureState(
             state=state, revision=new_rev
         )
-        return new_rev
+        return CasResult(revision=new_rev, applied=True, state=state)
 
 
 class _InMemoryDb:

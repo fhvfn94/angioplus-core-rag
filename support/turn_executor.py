@@ -36,6 +36,26 @@ Because the read session is closed before PROCESS and the write session is
 opened after it, no database lock or transaction is held across any
 analyzer / knowledge / response-generator call.
 
+IDEMPOTENT REPLAY (Slice HL-2b)
+-------------------------------
+Each entry point accepts an OPTIONAL, OPAQUE ``execution_id``. The executor
+never interprets it and knows nothing about where it came from: it forwards
+it to the store, which records it ATOMICALLY with the state so repeating the
+SAME id can never advance the durable state twice (and never rewrites the
+attempt log). There are TWO idempotent-hit paths and BOTH return the
+ACTUALLY persisted state with ``replayed`` ``True`` and ``turn`` ``None``:
+
+  * BEFORE PROCESS -- the persisted state was ALREADY advanced by this SAME
+    id (a sequential replay); PROCESS and the CAS write are skipped; or
+  * AFTER PROCESS -- this call's CAS lost a race to ANOTHER worker holding
+    the SAME id (``CasResult.applied`` is ``False``); the recomputed turn is
+    DISCARDED and the persisted winner state is returned. This is correct
+    WITHOUT any external single-flight.
+
+A DIFFERENT id with a stale revision still raises ``ProcedureStateConflict``.
+No idempotency SERVICE is imported; the id is just an opaque value passed
+through.
+
 FAILURE SEMANTICS
 -----------------
   * Provider failures are already absorbed inside the frozen orchestrator
@@ -83,14 +103,27 @@ from support.response_generator import ResponseProvider
 class PersistedTurnResult:
     """A :class:`TurnResult` plus the durable coordinates of its persistence.
 
-    ``state`` is exactly ``turn.state`` (the persisted next state) and
-    ``revision`` is the NEW revision written by the CAS.
+    On a NORMAL turn, ``state`` is exactly ``turn.state`` (the persisted next
+    state) and ``revision`` is the NEW revision written by the CAS.
+
+    When ``replayed`` is ``True`` the turn was an IDEMPOTENT hit: the durable
+    state had ALREADY been advanced by this execution id, so nothing was
+    recomputed and nothing was written. In that case ``turn`` is ``None``,
+    ``state`` is the ACTUALLY persisted state (never a recomputed candidate)
+    and ``revision`` is the CURRENT, unchanged revision.
     """
 
     conversation_id: str
-    turn: TurnResult
+    turn: Optional[TurnResult]
     state: ProcedureState
     revision: int
+    replayed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.replayed and self.turn is not None:
+            raise ValueError("a replayed result carries no recomputed turn.")
+        if not self.replayed and self.turn is None:
+            raise ValueError("a non-replayed result requires a turn.")
 
 
 class SupportTurnExecutor:
@@ -117,6 +150,7 @@ class SupportTurnExecutor:
         history: Sequence[Mapping[str, str]] = (),
         knowledge_backend: Optional[KnowledgeBackend] = None,
         response_provider: Optional[ResponseProvider] = None,
+        execution_id: Optional[str] = None,
     ) -> PersistedTurnResult:
         """Process one turn (analyzer ONCE) and persist its state under CAS.
 
@@ -125,6 +159,9 @@ class SupportTurnExecutor:
         input (the executor never reads the message log). ``conversation_id``
         must reference an existing conversation (FK precondition); creating
         conversations is out of scope.
+
+        ``execution_id`` is an OPTIONAL, OPAQUE idempotency identity (the
+        executor never interprets it); see :meth:`_execute_persisted`.
         """
 
         def _process(previous_state: Optional[ProcedureState]) -> TurnResult:
@@ -139,7 +176,9 @@ class SupportTurnExecutor:
             )
 
         return await self._execute_persisted(
-            conversation_id=conversation_id, process=_process
+            conversation_id=conversation_id,
+            process=_process,
+            execution_id=execution_id,
         )
 
     async def execute_persisted_turn_from_observation(
@@ -150,6 +189,7 @@ class SupportTurnExecutor:
         procedure: Procedure,
         knowledge_backend: Optional[KnowledgeBackend] = None,
         response_provider: Optional[ResponseProvider] = None,
+        execution_id: Optional[str] = None,
     ) -> PersistedTurnResult:
         """Persist one turn from a PRECOMPUTED observation (no re-analysis).
 
@@ -164,6 +204,9 @@ class SupportTurnExecutor:
 
         ``procedure`` is RESOLVED and supplied by the caller; ``conversation_id``
         must reference an existing conversation (FK precondition).
+
+        ``execution_id`` is an OPTIONAL, OPAQUE idempotency identity (the
+        executor never interprets it); see :meth:`_execute_persisted`.
         """
 
         def _process(previous_state: Optional[ProcedureState]) -> TurnResult:
@@ -176,7 +219,9 @@ class SupportTurnExecutor:
             )
 
         return await self._execute_persisted(
-            conversation_id=conversation_id, process=_process
+            conversation_id=conversation_id,
+            process=_process,
+            execution_id=execution_id,
         )
 
     async def _execute_persisted(
@@ -184,16 +229,43 @@ class SupportTurnExecutor:
         *,
         conversation_id: str,
         process: Callable[[Optional[ProcedureState]], TurnResult],
+        execution_id: Optional[str] = None,
     ) -> PersistedTurnResult:
         """The SINGLE shared durable lifecycle (one persistence writer).
 
         Both public entry points delegate here, so the READ -> PROCESS -> CAS
         WRITE boundaries -- and the one CAS writer -- live in exactly one
         place. No transaction is held across PROCESS.
+
+        ``execution_id`` is an OPTIONAL, OPAQUE idempotency identity. The
+        executor never interprets it and knows nothing about where it came
+        from; it only forwards it to the store so that repeating the SAME id
+        cannot advance the durable state twice. When it is supplied and the
+        persisted state was ALREADY advanced by that SAME id, the turn is an
+        IDEMPOTENT HIT: PROCESS and the CAS are skipped entirely and the
+        actually persisted state is returned. If instead the CAS itself loses
+        a race to the SAME id, ``CasResult.applied`` is ``False`` and the
+        recomputed turn is DISCARDED in favour of the persisted winner state.
         """
         # 1. READ (short, read-only, lock-free, then closed).
         async with self._session_factory() as session:
             stored = await self._store_factory(session).read(conversation_id)
+
+        # IDEMPOTENT HIT: this execution already advanced the durable state.
+        # Return the PERSISTED state (never a recomputed candidate) and skip
+        # PROCESS and the CAS write entirely.
+        if (
+            execution_id is not None
+            and stored is not None
+            and stored.last_execution_id == execution_id
+        ):
+            return PersistedTurnResult(
+                conversation_id=conversation_id,
+                turn=None,
+                state=stored.state,
+                revision=stored.revision,
+                replayed=True,
+            )
 
         previous_state = stored.state if stored is not None else None
         expected_revision = stored.revision if stored is not None else None
@@ -205,21 +277,40 @@ class SupportTurnExecutor:
         async with self._session_factory() as session:
             store = self._store_factory(session)
             try:
-                new_revision = await store.save_cas(
-                    conversation_id,
-                    turn.state,
-                    expected_revision=expected_revision,
+                save_kwargs: dict = {"expected_revision": expected_revision}
+                if execution_id is not None:
+                    # Pass the opaque id ONLY when supplied, so a caller that
+                    # does not use idempotency keeps the EXACT previous
+                    # ``save_cas`` call shape (and any pre-existing custom
+                    # store stays compatible).
+                    save_kwargs["execution_id"] = execution_id
+                cas = await store.save_cas(
+                    conversation_id, turn.state, **save_kwargs
                 )
                 await session.commit()
             except ProcedureStateConflict:
                 await session.rollback()
                 raise
 
+        # POST-CAS IDEMPOTENT HIT: another worker with the SAME execution id
+        # won the race between our READ and our CAS. Our write did NOT apply,
+        # so DISCARD the recomputed turn/state we just produced and return the
+        # ACTUALLY persisted state instead. This makes the same-execution-id
+        # race correct WITHOUT external single-flight.
+        if not cas.applied:
+            return PersistedTurnResult(
+                conversation_id=conversation_id,
+                turn=None,
+                state=cas.state,
+                revision=cas.revision,
+                replayed=True,
+            )
+
         return PersistedTurnResult(
             conversation_id=conversation_id,
             turn=turn,
-            state=turn.state,
-            revision=new_revision,
+            state=cas.state,
+            revision=cas.revision,
         )
 
 

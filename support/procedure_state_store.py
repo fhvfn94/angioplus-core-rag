@@ -35,6 +35,19 @@ attempt log, and every loser aborts before touching it. INVARIANT: every
 writer must go through this store (``ProcedureStateService.save`` is not
 wired to any runtime path), so no other writer can race the attempt log.
 
+IDEMPOTENT REPLAY (Slice HL-2b)
+-------------------------------
+An OPTIONAL, OPAQUE ``execution_id`` may be supplied to :meth:`save_cas`.
+When it is, the id is written ATOMICALLY with the state (same INSERT /
+UPDATE -- no second transaction), and a repeat of the SAME id is an
+idempotent no-op: NOTHING is written, no revision is bumped, the attempt log
+is NOT rewritten, and the CURRENT PERSISTED state (loaded from the DB) is
+returned with ``applied=False``. This lets the store tell an idempotent
+replay apart from a genuine stale-writer conflict (the latter still raises
+:class:`ProcedureStateConflict`). The store never interprets the id and
+knows nothing about where it came from; callers that supply none keep the
+previous behaviour exactly (the column stays NULL).
+
 FK PRECONDITION: ``procedure_states.conversation_id`` references
 ``conversations.conversation_id``. This store therefore REQUIRES an existing
 conversation row; it does NOT create one (conversation/channel lifecycle is
@@ -77,10 +90,35 @@ class ProcedureStateConflict(Exception):
 
 @dataclass(frozen=True)
 class PersistedProcedureState:
-    """A persisted :class:`ProcedureState` plus its write revision."""
+    """A persisted :class:`ProcedureState` plus its write revision.
+
+    ``last_execution_id`` is the OPAQUE idempotency identity of the LAST
+    write (see :meth:`ProcedureStateStore.save_cas`); it is ``None`` when no
+    execution id was supplied and carries no channel/runtime meaning.
+    """
 
     state: ProcedureState
     revision: int
+    last_execution_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CasResult:
+    """The outcome of ONE :meth:`ProcedureStateStore.save_cas` attempt.
+
+    ``applied`` is the discriminator an ``int``-only return would drop:
+
+      * ``applied=True``  -- THIS call wrote the row. ``revision`` is the
+        NEW persisted revision and ``state`` is exactly what was persisted.
+      * ``applied=False`` -- THIS call did NOT write: another write of the
+        SAME ``execution_id`` already advanced the row. ``revision`` is the
+        CURRENT persisted revision and ``state`` is the CURRENT persisted
+        state LOADED FROM THE DB -- never the caller's candidate state.
+    """
+
+    revision: int
+    applied: bool
+    state: ProcedureState
 
 
 class ProcedureStateStore:
@@ -112,6 +150,7 @@ class ProcedureStateStore:
         return PersistedProcedureState(
             state=await self._to_state(row),
             revision=row.revision,
+            last_execution_id=row.last_execution_id,
         )
 
     # ------------------------------------------------------------
@@ -124,33 +163,49 @@ class ProcedureStateStore:
         state: ProcedureState,
         *,
         expected_revision: Optional[int],
-    ) -> int:
+        execution_id: Optional[str] = None,
+    ) -> CasResult:
         """Persist ``state`` iff it still matches ``expected_revision``.
 
         ``expected_revision is None`` means "I read no row; create the first
         one". Otherwise the row must still be at ``expected_revision``.
 
-        Returns the NEW revision (``1`` on cold start, else
-        ``expected_revision + 1``). Raises :class:`ProcedureStateConflict`
-        on a CAS miss and writes NOTHING (neither the state row nor the
-        attempt log). Transaction-agnostic: the caller commits.
+        ``execution_id`` is an OPTIONAL, OPAQUE idempotency identity. When it
+        is supplied it is written atomically with the state, and a REPEAT of
+        the same id is an idempotent no-op: NOTHING is written (no revision
+        bump, no attempt-log rewrite) and the CURRENT persisted state is
+        returned with ``applied=False``. When it is omitted (``None``) the
+        call behaves exactly as before.
+
+        Returns a :class:`CasResult`: ``applied=True`` carries the NEW
+        revision and the state that was persisted; ``applied=False`` carries
+        the CURRENT revision and the CURRENT persisted state loaded from the
+        DB (NEVER the caller's candidate). Raises
+        :class:`ProcedureStateConflict` on a genuine CAS miss (a DIFFERENT or
+        absent execution id) and writes NOTHING (neither the state row nor
+        the attempt log). Transaction-agnostic: the caller commits.
         """
         if expected_revision is None:
-            new_revision = await self._insert_cold_start(
-                conversation_id, state
+            result = await self._insert_cold_start(
+                conversation_id, state, execution_id
             )
         else:
-            new_revision = await self._update_cas(
-                conversation_id, state, expected_revision
+            result = await self._update_cas(
+                conversation_id, state, expected_revision, execution_id
             )
 
-        # Only the CAS winner reaches here, so the attempt log cannot race.
-        await self._replace_attempts(conversation_id, state)
-        return new_revision
+        # Only a REAL CAS write replaces the attempt log; an idempotent hit
+        # (``applied=False``) NEVER rewrites the attempt history.
+        if result.applied:
+            await self._replace_attempts(conversation_id, state)
+        return result
 
     async def _insert_cold_start(
-        self, conversation_id: str, state: ProcedureState
-    ) -> int:
+        self,
+        conversation_id: str,
+        state: ProcedureState,
+        execution_id: Optional[str],
+    ) -> CasResult:
         statement = (
             pg_insert(ProcedureStateRow)
             .values(
@@ -164,27 +219,49 @@ class ProcedureStateStore:
                 clarification_topic=state.clarification_topic,
                 schema_version=state.schema_version,
                 revision=COLD_START_REVISION,
+                last_execution_id=execution_id,
             )
             .on_conflict_do_nothing(index_elements=["conversation_id"])
             .returning(ProcedureStateRow.revision)
         )
         result = await self._session.execute(statement)
         inserted_revision = result.scalar_one_or_none()
-        if inserted_revision is None:
-            # A concurrent cold start created the row first. Never fall back
-            # to an UPDATE (that would silently overwrite the winner).
-            raise ProcedureStateConflict(
+        if inserted_revision is not None:
+            return CasResult(
+                revision=inserted_revision, applied=True, state=state
+            )
+        # The row already exists. If it was created by THIS SAME execution id
+        # (a replayed / raced cold start) the write is an idempotent no-op;
+        # otherwise it is a genuine concurrent cold start -> conflict. Never
+        # fall back to an UPDATE (that would silently overwrite the winner).
+        return await self._resolve_idempotent_or_conflict(
+            conversation_id,
+            execution_id,
+            miss_message=(
                 f"procedure state for {conversation_id!r} was created "
                 "concurrently"
-            )
-        return inserted_revision
+            ),
+        )
 
     async def _update_cas(
         self,
         conversation_id: str,
         state: ProcedureState,
         expected_revision: int,
-    ) -> int:
+        execution_id: Optional[str],
+    ) -> CasResult:
+        # Idempotency short-circuit BEFORE the CAS: the executor re-reads the
+        # (already advanced) revision, so ``expected_revision`` would match --
+        # yet THIS execution must not bump the revision a second time.
+        if execution_id is not None:
+            row = await self._load_row(conversation_id)
+            if row is not None and row.last_execution_id == execution_id:
+                return CasResult(
+                    revision=row.revision,
+                    applied=False,
+                    state=await self._to_state(row),
+                )
+
         statement = (
             update(ProcedureStateRow)
             .where(
@@ -201,18 +278,65 @@ class ProcedureStateStore:
                 clarification_topic=state.clarification_topic,
                 schema_version=state.schema_version,
                 revision=ProcedureStateRow.revision + 1,
+                last_execution_id=execution_id,
                 updated_at=func.now(),
             )
             .returning(ProcedureStateRow.revision)
         )
         result = await self._session.execute(statement)
         new_revision = result.scalar_one_or_none()
-        if new_revision is None:
-            raise ProcedureStateConflict(
+        if new_revision is not None:
+            return CasResult(revision=new_revision, applied=True, state=state)
+        # Stale revision: a genuine concurrent writer (conflict) OR the SAME
+        # execution id that won a race between our read and this CAS
+        # (idempotent no-op).
+        return await self._resolve_idempotent_or_conflict(
+            conversation_id,
+            execution_id,
+            miss_message=(
                 f"procedure state for {conversation_id!r} is no longer at "
                 f"revision {expected_revision}"
+            ),
+        )
+
+    async def _load_row(
+        self, conversation_id: str
+    ) -> Optional[ProcedureStateRow]:
+        result = await self._session.execute(
+            select(ProcedureStateRow).where(
+                ProcedureStateRow.conversation_id == conversation_id
             )
-        return new_revision
+        )
+        return result.scalar_one_or_none()
+
+    async def _resolve_idempotent_or_conflict(
+        self,
+        conversation_id: str,
+        execution_id: Optional[str],
+        *,
+        miss_message: str,
+    ) -> CasResult:
+        """Tell an idempotent replay apart from a genuine CAS conflict.
+
+        Consulted ONLY on a CAS-miss path. A row whose ``last_execution_id``
+        equals this call's ``execution_id`` means the SAME execution already
+        advanced the state -> idempotent no-op (return the CURRENT persisted
+        state/revision, write nothing). Anything else (a different id, or no
+        id at all) is a real conflict and raises
+        :class:`ProcedureStateConflict`.
+        """
+        row = await self._load_row(conversation_id)
+        if (
+            row is not None
+            and execution_id is not None
+            and row.last_execution_id == execution_id
+        ):
+            return CasResult(
+                revision=row.revision,
+                applied=False,
+                state=await self._to_state(row),
+            )
+        raise ProcedureStateConflict(miss_message)
 
     async def _replace_attempts(
         self, conversation_id: str, state: ProcedureState
@@ -272,6 +396,7 @@ class ProcedureStateStore:
 
 __all__ = [
     "COLD_START_REVISION",
+    "CasResult",
     "PersistedProcedureState",
     "ProcedureStateConflict",
     "ProcedureStateStore",

@@ -50,6 +50,7 @@ from support.procedure_catalog import ProcedureCatalog
 from support.procedure_state import ProcedureState
 from support.procedure_state_store import (
     COLD_START_REVISION,
+    CasResult,
     PersistedProcedureState,
     ProcedureStateConflict,
 )
@@ -140,7 +141,7 @@ class _InMemoryStore:
                 raise ProcedureStateConflict("stale revision")
             new_revision = expected_revision + 1
         self._db.states[conversation_id] = (state, new_revision)
-        return new_revision
+        return CasResult(revision=new_revision, applied=True, state=state)
 
 
 def _session_factory(db: _InMemoryDB):

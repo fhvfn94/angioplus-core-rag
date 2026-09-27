@@ -509,6 +509,9 @@ def test_module_is_wired_only_into_the_application_boundary():
         "yandex/chat/server.py",
         "yandex/chat/alice_support_agent.py",
     ):
-        text = (root / relative).read_text(encoding="utf-8")
+        path = root / relative
+        if not path.exists():  # untracked legacy runtime: absence == unwired
+            continue
+        text = path.read_text(encoding="utf-8")
         assert "turn_dispatch" not in text, relative
         assert "SupportTurnDispatcher" not in text, relative

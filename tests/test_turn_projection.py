@@ -108,6 +108,9 @@ def test_module_is_wired_only_into_the_dispatch_boundary():
         "yandex/chat/alice_support_agent.py",
         "yandex/realtime/web/server.py",
     ):
+        path = root / rel
+        if not path.exists():  # untracked legacy runtime: absence == unwired
+            continue
         assert not _imports_module(
-            root / rel, "support.turn_projection"
+            path, "support.turn_projection"
         ), rel

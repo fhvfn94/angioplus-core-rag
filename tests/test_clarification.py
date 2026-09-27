@@ -97,6 +97,9 @@ def test_responder_is_wired_only_into_the_application_boundary():
         "yandex/chat/server.py",
         "yandex/chat/alice_support_agent.py",
     ):
-        text = (root / rel).read_text(encoding="utf-8")
+        path = root / rel
+        if not path.exists():  # untracked legacy runtime: absence == unwired
+            continue
+        text = path.read_text(encoding="utf-8")
         assert "support.clarification" not in text, rel
         assert "ClarificationResult" not in text, rel

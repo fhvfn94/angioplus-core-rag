@@ -14,11 +14,14 @@ Turn the ALREADY-MADE application result of ONE support turn
   + ConversationState   (support.domain)
         |
         v
-    RuntimeTurn  (this module)
+    RuntimeTurn  (this module)     -- a genuine NEW turn
+  or RuntimeReplay (this module)   -- an ENGINE REPLAY (already applied)
 
-into the SINGLE immutable runtime value a transport layer consumes: the
-user-facing ``text``, the channel ``decision`` / ``reason``, the
-``case_action`` and the ONE FSM ``fsm_event`` (or ``None``).
+into the SINGLE immutable runtime value a transport layer consumes: either
+the user-facing ``text`` + channel ``decision`` / ``reason`` +
+``case_action`` + the ONE FSM ``fsm_event`` (or ``None``) of a genuine turn
+(:class:`RuntimeTurn`), or the content-free "already applied -- do NOT
+re-apply" marker of an engine replay (:class:`RuntimeReplay`).
 
 SINGLE DECISION OWNER
 ---------------------
@@ -33,21 +36,43 @@ that translation) and preserves its result VERBATIM. It adds ONLY:
     an ``INTERNAL_ERROR`` (an internal-consistency failure that must never be
     mistaken for a semantic decision).
 
+The engine-replay detection (HL-2c.2) is likewise mechanical: it classifies
+the ALREADY-TYPED ``persisted.replayed`` flag, adds no policy, and
+short-circuits BEFORE the projection owner is consulted (see below).
+
 It never reads the raw message or a
 :class:`~support.observation.SemanticObservation`, never walks procedure
 transitions, and runs no router, no reducer and no LLM.
 
+ENGINE REPLAY (HL-2c.2)
+-----------------------
+Replay is EXECUTION SEMANTICS, not a business decision. When the ENGINE
+already applied this execution (HL-2b idempotency, surfaced by HL-2c.1), the
+outcome is a ``TURN_EXECUTED`` carrying a ``PersistedTurnResult`` with
+``replayed`` ``True`` and ``turn`` ``None``. Such an outcome is projected to
+:class:`RuntimeReplay` and NEVER reaches
+:func:`support.lifecycle_projection.project_turn_outcome` -- so a replay can
+produce NO decision, NO reason, NO FSM event, NO case action and NO
+(re-generated) text. This is LEVEL B (engine / procedure replay); the
+separate LEVEL A (a finalized inbound-event replay in the runtime) is NOT
+handled here.
+
 WHAT IT DELIBERATELY DOES NOT DO (later HL slices own these)
 -----------------------------------------------------------
-No DB / session work, no message persistence, no idempotency, no FSM
-execution, no HTTP serialization, no replay / crash semantics, no server.py
-wiring, no n8n / Tracker, no production composition root. It is a pure,
-total projection over typed inputs, unit-testable in isolation.
+No DB / session work, no message persistence, no inbound-event idempotency,
+no FSM execution, no HTTP serialization, no finalized-runtime replay, no
+crash-recovery semantics, no server.py wiring, no n8n / Tracker, no
+production composition root. It is a pure, total projection over typed
+inputs, unit-testable in isolation.
 
 This module carries NO ``retrieval_used`` flag: it is a legacy HTTP
 compatibility field that ``SupportTurnOutcome`` does not expose truthfully.
 Preserving it is an HL-2c decision, so HL-2a neither hardcodes, infers nor
-inspects it.
+inspects it. HL-2c.2 does NOT resolve it either: a runtime replay must not
+hardcode, infer or regenerate ``retrieval_used`` from the decision. Exact
+replay fidelity for this field requires the runtime's finalized idempotency
+storage to persist it first (documented follow-up, before the production
+cutover).
 """
 
 from __future__ import annotations
@@ -195,23 +220,103 @@ def _require_non_blank(value: Optional[str], field: str) -> None:
 
 
 # ============================================================
+# RUNTIME REPLAY (HL-2c.2)
+# ============================================================
+
+@dataclass(frozen=True)
+class RuntimeReplay:
+    """The runtime contract of ONE engine replay (an ALREADY-applied turn).
+
+    NOT a turn. It carries the SMALLEST possible identity and NOTHING else:
+    no ``text``, no ``decision``, no ``reason``, no ``case_action``, no
+    ``fsm_event`` and no ``RuntimeTurnKind``. Those effect-bearing fields are
+    STRUCTURALLY ABSENT, so a replay can never be mistaken for, coerced into
+    or rendered as a new turn, and no FSM / case / wording effect is even
+    expressible from it. It exists ONLY to tell the runtime: "this execution
+    was already applied -- do NOT re-apply it".
+
+    The answer text for a duplicate DELIVERY is deliberately NOT here: the
+    engine produced NO wording for a replay (``persisted.turn`` is ``None``),
+    and reconstructing the original response body is the runtime's OWN
+    finalized-idempotency concern (LEVEL A), not this engine-level value.
+
+    ``RuntimeReplay`` itself is the discriminator: ``isinstance(result,
+    RuntimeReplay)`` distinguishes a replay from a genuine
+    :class:`RuntimeTurn`; no shared ``kind`` enum member is introduced.
+    """
+
+    outcome_status: str
+    conversation_id: str
+
+    def __post_init__(self) -> None:
+        _require_non_blank(self.outcome_status, "outcome_status")
+        _require_non_blank(self.conversation_id, "conversation_id")
+
+
+# The closed runtime RESULT vocabulary of ONE support-turn attempt: EITHER a
+# genuine new turn OR an engine replay -- never both, never anything else.
+RuntimeResult = RuntimeTurn | RuntimeReplay
+
+
+# ============================================================
 # PROJECTION
 # ============================================================
+
+_ABSENT = object()
+
+
+def _is_engine_replay(outcome: RuntimeTurnOutcomeLike) -> bool:
+    """Is this the ONE legitimate HL-2b / HL-2c.1 engine-replay shape?
+
+    A replayed ``TURN_EXECUTED`` carries a ``PersistedTurnResult`` whose
+    ``replayed`` is ``True`` and whose ``turn`` is ``None`` -- the ONLY such
+    combination the ``PersistedTurnResult`` invariant admits (a replayed
+    result carries no recomputed turn; a non-replayed one requires a turn).
+
+    EVERY other shape is NOT a replay and follows the existing projection
+    path UNCHANGED (fail closed), so a malformed executed payload can never
+    be silently reclassified: a ``turn`` of ``None`` WITHOUT the replay flag,
+    or a contradictory replay flag WITH a turn, are both rejected here.
+    """
+    if outcome.status != _TURN_EXECUTED:
+        return False
+    persisted = outcome.persisted
+    if persisted is None:
+        return False
+    return (
+        getattr(persisted, "replayed", _ABSENT) is True
+        and getattr(persisted, "turn", _ABSENT) is None
+    )
+
 
 def adapt_turn_outcome(
     outcome: RuntimeTurnOutcomeLike,
     state: ConversationState,
-) -> RuntimeTurn:
+) -> RuntimeResult:
     """Project ONE already-made support turn into the runtime contract.
 
-    Pure, total and deterministic over the closed vocabularies: it reads only
-    the typed ``outcome`` and the CURRENT FSM ``state``. It re-derives NO
-    decision -- ``decision`` / ``reason`` / ``fsm_event`` / ``case_action``
-    come VERBATIM from
-    :func:`support.lifecycle_projection.project_turn_outcome`, and the ONLY
-    value added here is the user-facing ``text`` plus the typed
+    Returns EITHER a :class:`RuntimeTurn` (a genuine new application turn) OR
+    a :class:`RuntimeReplay` (an engine replay).
+
+    The engine-replay branch is detected FIRST and returns BEFORE
+    :func:`support.lifecycle_projection.project_turn_outcome` is consulted,
+    so an engine replay NEVER reaches LifecycleProjection and can produce NO
+    decision, NO reason, NO FSM event, NO case action, and NO
+    re-rendered text.
+
+    For every NON-replay outcome the behaviour is EXACTLY as before: pure,
+    total and deterministic over the closed vocabularies, it reads only the
+    typed ``outcome`` and the CURRENT FSM ``state``, re-derives NO decision --
+    ``decision`` / ``reason`` / ``fsm_event`` / ``case_action`` come VERBATIM
+    from :func:`support.lifecycle_projection.project_turn_outcome` -- and the
+    ONLY value added is the user-facing ``text`` plus the typed
     ``USER_RESPONSE`` / ``INTERNAL_ERROR`` distinction.
     """
+    if _is_engine_replay(outcome):
+        return RuntimeReplay(
+            outcome_status=outcome.status,
+            conversation_id=outcome.conversation_id,
+        )
     projection = project_turn_outcome(outcome, state)
     return RuntimeTurn(
         kind=_kind_for(projection.decision),
@@ -272,6 +377,8 @@ def _payload_member(root: Optional[object], path: tuple[str, ...], label: str):
 
 
 __all__ = [
+    "RuntimeReplay",
+    "RuntimeResult",
     "RuntimeTurn",
     "RuntimeTurnKind",
     "RuntimeTurnOutcomeLike",

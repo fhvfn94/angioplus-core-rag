@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from support import runtime_outcome
 from support import support_core as sc
 from support.clarification import clarify
 from support.domain import (
@@ -40,6 +41,8 @@ from support.router import (
     RoutingDecision,
 )
 from support.runtime_outcome import (
+    RuntimeReplay,
+    RuntimeResult,
     RuntimeTurn,
     RuntimeTurnKind,
     adapt_turn_outcome,
@@ -387,3 +390,165 @@ def test_internal_error_invariants():
     ):
         with pytest.raises(ValueError):
             _internal_error(**bad)
+
+
+# ============================================================
+# 11. HL-2c.2 ENGINE REPLAY (typed runtime replay boundary)
+# ============================================================
+
+def _replayed_turn_executed(*, conversation_id="chat-1", revision=4):
+    """The ONE legitimate HL-2b / HL-2c.1 replay shape: ``TURN_EXECUTED``
+    carrying a ``PersistedTurnResult`` with ``replayed`` ``True`` and
+    ``turn`` ``None``."""
+    return sc.SupportTurnOutcome(
+        status=sc.TURN_EXECUTED,
+        conversation_id=conversation_id,
+        persisted=PersistedTurnResult(
+            conversation_id=conversation_id,
+            turn=None,
+            state=ProcedureState(),
+            revision=revision,
+            replayed=True,
+        ),
+    )
+
+
+def test_normal_turn_executed_still_returns_runtime_turn():
+    outcome = _turn_executed(RouteAction.RECOMMEND_STEP)
+    result = adapt_turn_outcome(outcome, AI_ACTIVE)
+
+    assert isinstance(result, RuntimeTurn)
+    assert not isinstance(result, RuntimeReplay)
+    assert isinstance(result, RuntimeResult)
+    # Normal behaviour UNCHANGED: text / decision / reason / case / fsm.
+    assert result.text == "Шаг процедуры."
+    assert result.decision == "ANSWER"
+    assert result.reason == "PROCEDURE_STEP"
+    assert result.case_action is CaseAction.NONE
+    assert result.fsm_event is SupportEvent.USER_MESSAGE_AI
+
+
+def test_replayed_turn_executed_returns_runtime_replay():
+    result = adapt_turn_outcome(_replayed_turn_executed(), AI_ACTIVE)
+
+    assert isinstance(result, RuntimeReplay)
+    assert isinstance(result, RuntimeResult)
+    assert not isinstance(result, RuntimeTurn)
+    assert result.outcome_status == "TURN_EXECUTED"
+    assert result.conversation_id == "chat-1"
+
+
+def test_replay_no_longer_raises_attribute_error():
+    # Regression for the pre-HL-2c.2 crash:
+    # AttributeError: 'NoneType' object has no attribute 'decision'.
+    try:
+        result = adapt_turn_outcome(_replayed_turn_executed(), AI_ACTIVE)
+    except AttributeError as exc:  # pragma: no cover
+        pytest.fail(f"engine replay must not raise AttributeError: {exc}")
+    assert isinstance(result, RuntimeReplay)
+
+
+def test_runtime_replay_has_no_effect_fields():
+    replay = adapt_turn_outcome(_replayed_turn_executed(), AI_ACTIVE)
+
+    for forbidden in (
+        "text", "decision", "reason", "case_action", "fsm_event", "kind",
+    ):
+        assert not hasattr(replay, forbidden), forbidden
+
+
+def test_runtime_replay_does_not_expose_persisted_or_turn():
+    replay = adapt_turn_outcome(_replayed_turn_executed(), AI_ACTIVE)
+
+    assert not hasattr(replay, "persisted")
+    assert not hasattr(replay, "turn")
+    assert not hasattr(replay, "revision")
+    assert not hasattr(replay, "execution_id")
+
+
+def test_replay_does_not_call_lifecycle_projection(monkeypatch):
+    # A replay must BYPASS LifecycleProjection entirely -- proven with a
+    # sentinel, not merely by the absence of an AttributeError.
+    calls = []
+
+    def _boom(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError(
+            "project_turn_outcome must NOT run for an engine replay"
+        )
+
+    monkeypatch.setattr(runtime_outcome, "project_turn_outcome", _boom)
+
+    result = adapt_turn_outcome(_replayed_turn_executed(), AI_ACTIVE)
+
+    assert isinstance(result, RuntimeReplay)
+    assert calls == []  # projection was never consulted
+
+
+def test_replay_is_independent_of_state():
+    outcome = _replayed_turn_executed()
+    a = adapt_turn_outcome(outcome, AI_ACTIVE)
+    b = adapt_turn_outcome(outcome, AI_ACTIVE_WAITING_USER)
+    c = adapt_turn_outcome(outcome, HUMAN_ACTIVE_WAITING_OPERATOR)
+
+    # A replay consults no FSM state and moves nothing.
+    assert a == b == c
+    assert isinstance(a, RuntimeReplay)
+
+
+def test_malformed_executed_payload_is_not_silently_a_replay():
+    # ``turn is None`` WITHOUT the replay flag is NOT a legitimate replay
+    # shape: it falls through to the existing projection path and fails
+    # closed (AttributeError) -- it must NOT become a RuntimeReplay.
+    malformed = SimpleNamespace(
+        status="TURN_EXECUTED",
+        conversation_id="chat-1",
+        persisted=SimpleNamespace(replayed=False, turn=None),
+    )
+    result = None
+    with pytest.raises(AttributeError):
+        result = adapt_turn_outcome(malformed, AI_ACTIVE)
+    assert not isinstance(result, RuntimeReplay)
+
+
+def test_contradictory_replay_flag_with_a_turn_is_not_a_replay():
+    # ``replayed=True`` WITH a present turn is contradictory/malformed and
+    # must NOT be classified as a replay; it follows the existing turn path.
+    turn = SimpleNamespace(
+        assistant_text="Шаг процедуры.",
+        decision=_routing(RouteAction.RECOMMEND_STEP),
+    )
+    malformed = SimpleNamespace(
+        status="TURN_EXECUTED",
+        conversation_id="chat-1",
+        persisted=SimpleNamespace(replayed=True, turn=turn),
+    )
+    result = adapt_turn_outcome(malformed, AI_ACTIVE)
+
+    assert isinstance(result, RuntimeTurn)
+    assert not isinstance(result, RuntimeReplay)
+    assert result.text == "Шаг процедуры."
+
+
+def test_runtime_replay_invariants():
+    assert RuntimeReplay(
+        outcome_status="TURN_EXECUTED", conversation_id="chat-1"
+    ).conversation_id == "chat-1"
+
+    for bad in (
+        dict(outcome_status="", conversation_id="chat-1"),
+        dict(outcome_status="   ", conversation_id="chat-1"),
+        dict(outcome_status="TURN_EXECUTED", conversation_id=""),
+        dict(outcome_status="TURN_EXECUTED", conversation_id="  "),
+    ):
+        with pytest.raises(ValueError):
+            RuntimeReplay(**bad)
+
+
+def test_runtime_result_alias_covers_both_branches():
+    results = (
+        adapt_turn_outcome(_turn_executed(RouteAction.RECOMMEND_STEP), AI_ACTIVE),
+        adapt_turn_outcome(_replayed_turn_executed(), AI_ACTIVE),
+    )
+    assert all(isinstance(r, RuntimeResult) for r in results)
+    assert {type(r) for r in results} == {RuntimeTurn, RuntimeReplay}

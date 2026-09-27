@@ -176,6 +176,10 @@ def _build_semantic_schema() -> dict:
                 "items": {"type": "string"},
             },
             "new_issue": {"type": ["string", "null"]},
+            "request_kind": {
+                "type": "string",
+                "enum": ["problem", "information", "unclear"],
+            },
         },
         "required": [
             "scope",
@@ -184,6 +188,7 @@ def _build_semantic_schema() -> dict:
             "human_requested",
             "clarification_facts",
             "new_issue",
+            "request_kind",
         ],
     }
 

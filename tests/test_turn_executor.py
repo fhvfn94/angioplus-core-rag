@@ -76,6 +76,7 @@ def _obs_json(
     human_requested=False,
     clarification_facts=(),
     new_issue=None,
+    request_kind="problem",
 ) -> str:
     return json.dumps(
         {
@@ -87,6 +88,7 @@ def _obs_json(
             "human_requested": human_requested,
             "clarification_facts": list(clarification_facts),
             "new_issue": new_issue,
+            "request_kind": request_kind,
         }
     )
 

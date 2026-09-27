@@ -32,6 +32,7 @@ import pytest
 from support import procedure_catalog as pc
 from support.observation import (
     ObservationScope,
+    RequestKind,
     SemanticObservation,
     StepOutcome,
 )
@@ -82,6 +83,7 @@ def _obs() -> SemanticObservation:
         human_requested=False,
         clarification_facts=(),
         new_issue=None,
+        request_kind=RequestKind.PROBLEM,
     )
 
 

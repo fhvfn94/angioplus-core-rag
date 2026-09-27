@@ -156,7 +156,7 @@ def test_cloud_adapter_returns_raw_strict_json():
 
     data = json.loads(raw)
     assert isinstance(data, dict)
-    # The strict six-field contract (no extras): the adapter still owns no
+    # The strict seven-field contract (no extras): the adapter still owns no
     # parsing -- this only proves the model honoured the pinned schema.
     assert set(data) == {
         "scope",
@@ -165,6 +165,7 @@ def test_cloud_adapter_returns_raw_strict_json():
         "human_requested",
         "clarification_facts",
         "new_issue",
+        "request_kind",
     }
 
 

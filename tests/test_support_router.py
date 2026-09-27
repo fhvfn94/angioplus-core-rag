@@ -20,6 +20,7 @@ from support.observation import (
     ObservationScope,
     ProblemStatus,
     ReportedAction,
+    RequestKind,
     SemanticObservation,
     StepOutcome,
 )
@@ -70,6 +71,7 @@ def obs(
     human_requested: bool = False,
     facts: tuple[str, ...] = (),
     new_issue: str | None = None,
+    request_kind: RequestKind = RequestKind.PROBLEM,
 ) -> SemanticObservation:
     return SemanticObservation(
         scope=scope,
@@ -78,6 +80,7 @@ def obs(
         human_requested=human_requested,
         clarification_facts=facts,
         new_issue=new_issue,
+        request_kind=request_kind,
     )
 
 

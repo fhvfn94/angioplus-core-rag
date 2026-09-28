@@ -17,7 +17,9 @@ ONE turn by DELEGATING to them:
   6. ``support_core.py`` contains no routing / reducing / retrieval /
      generation implementation (no module-level helper, no async behaviour
      outside the composition boundary);
-  7. no runtime module imports ``support_core`` yet;
+  7. EXACTLY ONE sanctioned runtime module (the Stateful Turn Runtime in
+     ``support/runtime_service.py``) imports ``support_core``; every other
+     runtime / transport module still does not;
   8. ``yandex/chat/server.py`` stays untouched by this sub-slice;
   9. ``handle_turn`` resolves the CANDIDATE Procedure cold-start via
      ``ProcedureCatalog.select`` (unique match -> that Procedure, otherwise
@@ -564,11 +566,21 @@ def _imports_support_core(path: Path) -> bool:
     return False
 
 
-def test_no_runtime_module_imports_support_core_yet():
+# The ONE sanctioned application composition module allowed to import the
+# composition boundary. HL-2c.3b.2 moves the wiring decision: the Stateful Turn
+# Runtime (``support/runtime_service.py``) is now the sole owner of
+# ``SupportCore`` access. Every other production module -- in particular every
+# transport / runtime entry point -- must go through it.
+_SANCTIONED_SUPPORT_CORE_OWNERS = frozenset(
+    {str((_repo_root() / "support/runtime_service.py").resolve())}
+)
+
+
+def test_only_the_sanctioned_runtime_module_imports_support_core():
     core_path = Path(sc.__file__).resolve()
     root = _repo_root()
 
-    offenders: list[str] = []
+    offenders: set[str] = set()
     for pattern in ("support/**/*.py", "yandex/**/*.py", "*.py"):
         for path in root.glob(pattern):
             resolved = path.resolve()
@@ -577,10 +589,17 @@ def test_no_runtime_module_imports_support_core_yet():
             if "tests" in path.parts:
                 continue
             if _imports_support_core(path):
-                offenders.append(str(path))
+                offenders.add(str(resolved))
 
-    assert offenders == []
+    # EXACTLY one owner: the sanctioned runtime composition module. A second
+    # owner FAILS (no other module may gain direct access to the boundary) and
+    # losing the owner FAILS too (the boundary must stay composed).
+    assert offenders == set(_SANCTIONED_SUPPORT_CORE_OWNERS)
 
+    # Positive control: the sanctioned module really is the full runtime.
+    assert _imports_support_core(root / "support/runtime_service.py")
+
+    # No transport / runtime entry point imports it directly.
     for relative in _RUNTIME_MODULES:
         path = root / relative
         if not path.exists():

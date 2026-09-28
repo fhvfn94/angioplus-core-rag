@@ -101,9 +101,10 @@ from support.response_generator import _INTERNAL_ERROR_TEXT
 
 # The EXISTING boundary status vocabulary owned by ``support.support_core``.
 # Pinned here (rather than imported) because the repository architecture guard
-# ``test_no_runtime_module_imports_support_core_yet`` forbids ANY sibling module
-# from importing the composition boundary. The focused tests build outcomes
-# from the REAL ``support_core`` constants, so any drift fails loudly.
+# ``test_only_the_sanctioned_runtime_module_imports_support_core`` forbids ANY
+# OTHER sibling module from importing the composition boundary. The focused
+# tests build outcomes from the REAL ``support_core`` constants, so any drift
+# fails loudly.
 _TURN_EXECUTED = "TURN_EXECUTED"
 _KNOWLEDGE_QA = "KNOWLEDGE_QA"
 _CLARIFICATION = "CLARIFICATION"

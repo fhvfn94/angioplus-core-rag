@@ -139,6 +139,7 @@ from support.alice_analyzer import AnalyzerProvider
 from support.alice_analyzer_yandex import YandexAnalyzerProvider
 from support.clarification import ClarificationResult
 from support.db import get_session_factory
+from support.domain import ConversationState
 from support.global_policy import GlobalAction
 from support.knowledge import KnowledgeBackend
 from support.knowledge_qa import KnowledgeQAProvider, KnowledgeQAResult
@@ -161,6 +162,7 @@ from support.turn_dispatch import (
 )
 from support.turn_executor import PersistedTurnResult, SupportTurnExecutor
 from support.turn_family import TurnFamily
+from support.turn_recovery_store import TurnRecoveryStore
 
 
 # ============================================================
@@ -295,6 +297,7 @@ class SupportCore:
             response_provider=...,
             session_factory=...,
             store_factory=...,
+            recovery_store_factory=...,
             turn_executor=...,
             turn_dispatcher=...,
         )
@@ -319,6 +322,9 @@ class SupportCore:
         store_factory: Callable[
             [AsyncSession], ProcedureStateStore
         ] = ProcedureStateStore,
+        recovery_store_factory: Callable[
+            [AsyncSession], TurnRecoveryStore
+        ] = TurnRecoveryStore,
         turn_executor: Optional[SupportTurnExecutor] = None,
         turn_dispatcher: Optional[SupportTurnDispatcher] = None,
     ) -> None:
@@ -349,6 +355,7 @@ class SupportCore:
         )
         self._session_factory = session_factory
         self._store_factory = store_factory
+        self._recovery_store_factory = recovery_store_factory
         self._turn_executor = turn_executor
         self._turn_dispatcher = turn_dispatcher
 
@@ -387,6 +394,13 @@ class SupportCore:
         return self._store_factory
 
     @property
+    def recovery_store_factory(
+        self,
+    ) -> Callable[[AsyncSession], TurnRecoveryStore]:
+        """The per-session ``TurnRecoveryStore`` factory (durable recovery)."""
+        return self._recovery_store_factory
+
+    @property
     def session_factory(self) -> async_sessionmaker[AsyncSession]:
         """The session factory, resolved from ``support.db`` on first use."""
         if self._session_factory is None:
@@ -404,6 +418,7 @@ class SupportCore:
             self._turn_executor = SupportTurnExecutor(
                 session_factory=self.session_factory,
                 store_factory=self._store_factory,
+                recovery_store_factory=self._recovery_store_factory,
             )
         return self._turn_executor
 
@@ -435,6 +450,7 @@ class SupportCore:
         message: str,
         history: Sequence[Mapping[str, str]] = (),
         execution_id: Optional[str] = None,
+        projection_state: Optional[ConversationState] = None,
     ) -> SupportTurnOutcome:
         """Resolve the candidate Procedure, then dispatch ONE support turn.
 
@@ -469,6 +485,15 @@ class SupportCore:
         therefore yields a replayed (NOT recomputed, NOT re-worded)
         ``TURN_EXECUTED`` outcome carrying the persisted winner.
 
+        ``projection_state`` is the OPTIONAL immutable
+        :class:`~support.domain.ConversationState` the runtime projection will
+        consult. It is forwarded UNCHANGED to the dispatcher, which forwards it
+        to the procedure executor ONLY; when present (together with an
+        ``execution_id``) the executor records the recovery record ATOMICALLY
+        with its CAS, so a duplicate delivery can reproduce the ORIGINAL
+        runtime turn without re-running anything. It is never stored on this
+        boundary.
+
         Returns a :class:`SupportTurnOutcome`. Raises
         :class:`~support.procedure_state_store.ProcedureStateConflict`
         unchanged when the executor's CAS loses a race (no automatic retry
@@ -500,13 +525,21 @@ class SupportCore:
             procedure = None if selection is None else selection.procedure
 
         # --- ONE dispatch: analysis -> global policy -> exactly one family ---
+        dispatch_kwargs: dict = {
+            "conversation_id": conversation_id,
+            "message": message,
+            "history": history,
+            "state": state,
+            "procedure": procedure,
+            "execution_id": execution_id,
+        }
+        if projection_state is not None:
+            # HL-2b's compatibility convention: OMIT an optional keyword when
+            # it is absent, so a caller that does not project keeps the EXACT
+            # previous dispatcher call shape.
+            dispatch_kwargs["projection_state"] = projection_state
         result: DispatchResult = await self.turn_dispatcher.dispatch(
-            conversation_id=conversation_id,
-            message=message,
-            history=history,
-            state=state,
-            procedure=procedure,
-            execution_id=execution_id,
+            **dispatch_kwargs
         )
         return self._project_outcome(conversation_id, result)
 

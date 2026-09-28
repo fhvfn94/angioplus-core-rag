@@ -111,6 +111,7 @@ from typing import Mapping, Optional, Sequence, Union
 
 from support.alice_analyzer import AnalyzerProvider
 from support.clarification import ClarificationResult, clarify
+from support.domain import ConversationState
 from support.global_policy import GlobalAction, evaluate_global_policy
 from support.knowledge import KnowledgeBackend
 from support.knowledge_qa import (
@@ -308,6 +309,7 @@ class SupportTurnDispatcher:
         state: Optional[ProcedureState] = None,
         procedure: Optional[Procedure] = None,
         execution_id: Optional[str] = None,
+        projection_state: Optional[ConversationState] = None,
     ) -> DispatchResult:
         """Analyze ONCE, select the family, and delegate to exactly one.
 
@@ -321,6 +323,12 @@ class SupportTurnDispatcher:
         parsed, normalised, hashed, truncated, combined, generated, validated
         semantically or inferred from ``conversation_id`` / ``message`` /
         ``history``. No other family can observe it.
+
+        ``projection_state`` is the OPTIONAL immutable
+        :class:`~support.domain.ConversationState` the runtime projection will
+        consult; it is forwarded to the procedure executor ONLY (which records
+        the recovery record atomically with its CAS). Every other family is
+        untouched.
         """
         # 1. The ONE analysis. The provider is sync + network-backed, so it
         #    is offloaded to a thread to keep the event loop free.
@@ -349,7 +357,11 @@ class SupportTurnDispatcher:
         # 4. Delegate to EXACTLY ONE family, using the SAME observation.
         if family is TurnFamily.PROCEDURE_SUPPORT:
             return await self._dispatch_procedure(
-                conversation_id, observation, procedure, execution_id
+                conversation_id,
+                observation,
+                procedure,
+                execution_id,
+                projection_state,
             )
         if family is TurnFamily.KNOWLEDGE_QA:
             return await self._dispatch_knowledge(message)
@@ -365,6 +377,7 @@ class SupportTurnDispatcher:
         observation: SemanticObservation,
         procedure: Optional[Procedure],
         execution_id: Optional[str] = None,
+        projection_state: Optional[ConversationState] = None,
     ) -> DispatchResult:
         """Run the procedure pipeline from the SAME observation.
 
@@ -391,6 +404,10 @@ class SupportTurnDispatcher:
             # when it is present, so a caller that does not use idempotency
             # keeps the EXACT previous executor call shape.
             kwargs["execution_id"] = execution_id
+        if projection_state is not None:
+            # Same convention: OMIT when absent so a non-recording caller keeps
+            # the exact previous executor call shape.
+            kwargs["projection_state"] = projection_state
 
         persisted = (
             await self._procedure_executor.execute_persisted_turn_from_observation(

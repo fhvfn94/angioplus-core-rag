@@ -416,3 +416,57 @@ class ProcedureStateAttemptRow(Base):
             "sequence",
         ),
     )
+
+
+# ============================================================
+# TURN RECOVERY (HL-2c.3a)
+# ============================================================
+
+class TurnRecoveryRow(Base):
+    """The DURABLE recovery record of ONE applied turn execution.
+
+    A SEPARATE persistence concern from :class:`ProcedureStateRow`. This table
+    is keyed by the OPAQUE ``execution_id`` (the idempotency identity already
+    used by ``ProcedureStateStore.save_cas``) and holds the MINIMUM material
+    needed to reproduce the ORIGINAL runtime turn of that execution WITHOUT
+    re-running the LLM / retrieval / procedure:
+
+      * the engine's canonical result -- ``text`` / ``action`` /
+        ``escalate_reason`` / ``clarify_reason``;
+      * the runtime PROJECTION SNAPSHOT -- ``projection_mode`` /
+        ``projection_support_status`` / ``projection_handoff_status``, i.e. the
+        ``ConversationState`` triple as it stood at CAS time. Those are runtime
+        / human-lifecycle state, NOT procedure progress, so they are
+        deliberately NOT columns of ``procedure_states``. They are captured
+        here because the FSM projection is state-dependent and the CURRENT
+        conversation state may have moved on by recovery time.
+
+    Written by ``support.turn_recovery_store.TurnRecoveryStore`` on the SAME
+    session / transaction as the ProcedureState CAS, so the two commit or roll
+    back together: there is never a crash window where the procedure state
+    advanced but this record is missing.
+    """
+
+    __tablename__ = "turn_recovery"
+
+    execution_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # --- canonical engine result (what the projection renders) ---
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    escalate_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    clarify_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- runtime projection snapshot (ConversationState at CAS time) ---
+    projection_mode: Mapped[str] = mapped_column(Text, nullable=False)
+    projection_support_status: Mapped[str] = mapped_column(
+        Text, nullable=False
+    )
+    projection_handoff_status: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

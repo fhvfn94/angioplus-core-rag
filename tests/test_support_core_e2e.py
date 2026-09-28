@@ -77,6 +77,8 @@ class _InMemoryDB:
     def __init__(self) -> None:
         self.states: dict[str, tuple[ProcedureState, int]] = {}
         self.execution_ids: dict[str, Optional[str]] = {}
+        self.recovery_records: dict[str, object] = {}
+        self.recovery_writes = 0
         self.read_calls = 0
         self.write_attempts = 0
         self.commits = 0
@@ -173,8 +175,31 @@ def _session_factory(db: _InMemoryDB):
     return lambda: _FakeSession(db)
 
 
+class _InMemoryRecoveryStore:
+    """TurnRecoveryStore double backed by the SAME pretend database."""
+
+    def __init__(self, db: _InMemoryDB) -> None:
+        self._db = db
+
+    async def save(self, payload) -> None:
+        self._db.recovery_records[payload.execution_id] = payload
+        self._db.recovery_writes += 1
+
+    async def read(self, *, execution_id, conversation_id):
+        payload = self._db.recovery_records.get(execution_id)
+        if payload is None:
+            return None
+        if payload.conversation_id != conversation_id:
+            raise AssertionError("recovery record for another conversation")
+        return payload
+
+
 def _store_factory(db: _InMemoryDB):
     return lambda session: _InMemoryStore(db)
+
+
+def _recovery_store_factory(db: _InMemoryDB):
+    return lambda session: _InMemoryRecoveryStore(db)
 
 
 # ============================================================
@@ -385,6 +410,7 @@ def _build(
         response_provider=response,
         session_factory=_session_factory(db),
         store_factory=_store_factory(db),
+        recovery_store_factory=_recovery_store_factory(db),
     )
     return _Harness(core, db, catalog, analyzer, backend, qa, response)
 

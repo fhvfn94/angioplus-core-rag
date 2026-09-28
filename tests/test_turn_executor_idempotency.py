@@ -162,11 +162,29 @@ class _FakeStore:
         )
 
 
+class _FakeRecoveryStore:
+    """``TurnRecoveryStore`` double: NO records (these callers never project).
+
+    ``save`` is an ASSERTION, not a no-op: none of the offline lifecycle
+    tests supplies a ``projection_state``, so NO recovery record may ever be
+    written. ``read`` returns ``None`` -- the legitimate ABSENT case.
+    """
+
+    async def save(self, payload):
+        raise AssertionError(
+            "no recovery record without a projection snapshot"
+        )
+
+    async def read(self, *, execution_id, conversation_id):
+        return None
+
+
 def _executor(store: _FakeStore) -> tuple[SupportTurnExecutor, _RecordingSessionFactory]:
     sessions = _RecordingSessionFactory()
     executor = SupportTurnExecutor(
         session_factory=sessions,
         store_factory=lambda session: store,
+        recovery_store_factory=lambda session: _FakeRecoveryStore(),
     )
     return executor, sessions
 

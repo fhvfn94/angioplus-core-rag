@@ -83,6 +83,7 @@ from typing import Callable, Mapping, Optional, Sequence
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from support.alice_analyzer import AnalyzerProvider
+from support.domain import ConversationState
 from support.knowledge import KnowledgeBackend
 from support.observation import SemanticObservation
 from support.orchestrator import (
@@ -97,6 +98,8 @@ from support.procedure_state_store import (
     ProcedureStateStore,
 )
 from support.response_generator import ResponseProvider
+from support.turn_recovery import TurnRecoveryPayload
+from support.turn_recovery_store import TurnRecoveryStore
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,14 @@ class PersistedTurnResult:
     recomputed and nothing was written. In that case ``turn`` is ``None``,
     ``state`` is the ACTUALLY persisted state (never a recomputed candidate)
     and ``revision`` is the CURRENT, unchanged revision.
+
+    ``recovery`` is the durable turn-recovery record (HL-2c.3a) belonging to
+    the WINNING ``execution_id``, exposed ONLY on a replay (``None`` on a
+    normal turn, which carries its own ``turn``). It is read VERBATIM from the
+    dedicated ``turn_recovery`` table -- never recomputed -- and is the
+    material from which the ORIGINAL runtime turn can be reproduced without
+    re-running the LLM / retrieval / procedure. ``None`` means no record was
+    stored (legacy caller) and the caller must NOT fabricate a turn.
     """
 
     conversation_id: str
@@ -118,12 +129,15 @@ class PersistedTurnResult:
     state: ProcedureState
     revision: int
     replayed: bool = False
+    recovery: Optional[TurnRecoveryPayload] = None
 
     def __post_init__(self) -> None:
         if self.replayed and self.turn is not None:
             raise ValueError("a replayed result carries no recomputed turn.")
         if not self.replayed and self.turn is None:
             raise ValueError("a non-replayed result requires a turn.")
+        if not self.replayed and self.recovery is not None:
+            raise ValueError("a recovery record is only exposed on a replay.")
 
 
 class SupportTurnExecutor:
@@ -136,9 +150,13 @@ class SupportTurnExecutor:
         store_factory: Callable[
             [AsyncSession], ProcedureStateStore
         ] = ProcedureStateStore,
+        recovery_store_factory: Callable[
+            [AsyncSession], TurnRecoveryStore
+        ] = TurnRecoveryStore,
     ) -> None:
         self._session_factory = session_factory
         self._store_factory = store_factory
+        self._recovery_store_factory = recovery_store_factory
 
     async def execute_persisted_turn(
         self,
@@ -151,6 +169,7 @@ class SupportTurnExecutor:
         knowledge_backend: Optional[KnowledgeBackend] = None,
         response_provider: Optional[ResponseProvider] = None,
         execution_id: Optional[str] = None,
+        projection_state: Optional[ConversationState] = None,
     ) -> PersistedTurnResult:
         """Process one turn (analyzer ONCE) and persist its state under CAS.
 
@@ -162,6 +181,11 @@ class SupportTurnExecutor:
 
         ``execution_id`` is an OPTIONAL, OPAQUE idempotency identity (the
         executor never interprets it); see :meth:`_execute_persisted`.
+        ``projection_state`` is the OPTIONAL immutable
+        :class:`~support.domain.ConversationState` the runtime projection will
+        consult; when supplied TOGETHER WITH an ``execution_id`` the recovery
+        record is written ATOMICALLY with the CAS (see
+        :meth:`_execute_persisted`).
         """
 
         def _process(previous_state: Optional[ProcedureState]) -> TurnResult:
@@ -175,11 +199,18 @@ class SupportTurnExecutor:
                 response_provider=response_provider,
             )
 
-        return await self._execute_persisted(
-            conversation_id=conversation_id,
-            process=_process,
-            execution_id=execution_id,
-        )
+        kwargs: dict = {
+            "conversation_id": conversation_id,
+            "process": _process,
+            "execution_id": execution_id,
+        }
+        if projection_state is not None:
+            # HL-2b compatibility convention: OMIT the optional keyword when it
+            # is absent, so a caller that does not project keeps the EXACT
+            # previous ``_execute_persisted`` call shape (and any pre-existing
+            # monkeypatch / subclass stays valid).
+            kwargs["projection_state"] = projection_state
+        return await self._execute_persisted(**kwargs)
 
     async def execute_persisted_turn_from_observation(
         self,
@@ -190,6 +221,7 @@ class SupportTurnExecutor:
         knowledge_backend: Optional[KnowledgeBackend] = None,
         response_provider: Optional[ResponseProvider] = None,
         execution_id: Optional[str] = None,
+        projection_state: Optional[ConversationState] = None,
     ) -> PersistedTurnResult:
         """Persist one turn from a PRECOMPUTED observation (no re-analysis).
 
@@ -206,7 +238,9 @@ class SupportTurnExecutor:
         must reference an existing conversation (FK precondition).
 
         ``execution_id`` is an OPTIONAL, OPAQUE idempotency identity (the
-        executor never interprets it); see :meth:`_execute_persisted`.
+        executor never interprets it); ``projection_state`` is the OPTIONAL
+        immutable :class:`~support.domain.ConversationState` the runtime
+        projection will consult. Both feed :meth:`_execute_persisted`.
         """
 
         def _process(previous_state: Optional[ProcedureState]) -> TurnResult:
@@ -218,11 +252,18 @@ class SupportTurnExecutor:
                 response_provider=response_provider,
             )
 
-        return await self._execute_persisted(
-            conversation_id=conversation_id,
-            process=_process,
-            execution_id=execution_id,
-        )
+        kwargs: dict = {
+            "conversation_id": conversation_id,
+            "process": _process,
+            "execution_id": execution_id,
+        }
+        if projection_state is not None:
+            # HL-2b compatibility convention: OMIT the optional keyword when it
+            # is absent, so a caller that does not project keeps the EXACT
+            # previous ``_execute_persisted`` call shape (and any pre-existing
+            # monkeypatch / subclass stays valid).
+            kwargs["projection_state"] = projection_state
+        return await self._execute_persisted(**kwargs)
 
     async def _execute_persisted(
         self,
@@ -230,6 +271,7 @@ class SupportTurnExecutor:
         conversation_id: str,
         process: Callable[[Optional[ProcedureState]], TurnResult],
         execution_id: Optional[str] = None,
+        projection_state: Optional[ConversationState] = None,
     ) -> PersistedTurnResult:
         """The SINGLE shared durable lifecycle (one persistence writer).
 
@@ -246,32 +288,61 @@ class SupportTurnExecutor:
         actually persisted state is returned. If instead the CAS itself loses
         a race to the SAME id, ``CasResult.applied`` is ``False`` and the
         recomputed turn is DISCARDED in favour of the persisted winner state.
+
+        ``projection_state`` is the OPTIONAL immutable
+        :class:`~support.domain.ConversationState` the runtime projection will
+        consult. When it is supplied TOGETHER WITH ``execution_id``, a
+        :class:`~support.turn_recovery.TurnRecoveryPayload` is captured from
+        the PROCESS result and written on the SAME session / transaction as
+        the CAS (step 3), so the procedure state and its recovery record
+        COMMIT OR ROLL BACK TOGETHER: there is no crash window in which the
+        CAS advanced but the recovery record is missing. Any idempotent replay
+        loads the WINNER's STORED record VERBATIM -- never one recomputed on
+        the hit.
         """
         # 1. READ (short, read-only, lock-free, then closed).
         async with self._session_factory() as session:
             stored = await self._store_factory(session).read(conversation_id)
 
-        # IDEMPOTENT HIT: this execution already advanced the durable state.
-        # Return the PERSISTED state (never a recomputed candidate) and skip
-        # PROCESS and the CAS write entirely.
-        if (
-            execution_id is not None
-            and stored is not None
-            and stored.last_execution_id == execution_id
-        ):
-            return PersistedTurnResult(
-                conversation_id=conversation_id,
-                turn=None,
-                state=stored.state,
-                revision=stored.revision,
-                replayed=True,
-            )
+            # IDEMPOTENT HIT: this execution already advanced the durable
+            # state. Load the WINNER's durable recovery record on the SAME
+            # read session, return the PERSISTED state (never a recomputed
+            # candidate) and skip PROCESS and the CAS write entirely.
+            if (
+                execution_id is not None
+                and stored is not None
+                and stored.last_execution_id == execution_id
+            ):
+                return PersistedTurnResult(
+                    conversation_id=conversation_id,
+                    turn=None,
+                    state=stored.state,
+                    revision=stored.revision,
+                    replayed=True,
+                    recovery=await self._read_recovery(
+                        session, conversation_id, execution_id
+                    ),
+                )
 
         previous_state = stored.state if stored is not None else None
         expected_revision = stored.revision if stored is not None else None
 
         # 2. PROCESS (no DB transaction open across provider calls).
         turn = process(previous_state)
+
+        # Capture the recovery record (canonical engine result + projection
+        # snapshot) BEFORE the write session opens -- pure scalar extraction.
+        # It is keyed by ``execution_id``, so it is built ONLY when an id was
+        # supplied AND a projection snapshot exists; otherwise NO record is
+        # written (legacy behaviour, untouched).
+        recovery: Optional[TurnRecoveryPayload] = None
+        if execution_id is not None and projection_state is not None:
+            recovery = TurnRecoveryPayload.capture(
+                execution_id=execution_id,
+                conversation_id=conversation_id,
+                turn=turn,
+                projection_state=projection_state,
+            )
 
         # 3. WRITE (short CAS transaction; commit).
         async with self._session_factory() as session:
@@ -287,23 +358,37 @@ class SupportTurnExecutor:
                 cas = await store.save_cas(
                     conversation_id, turn.state, **save_kwargs
                 )
+                if cas.applied and recovery is not None:
+                    # SAME session / transaction as the CAS, and ONLY for an
+                    # APPLIED write (a losing idempotent race never rewrites
+                    # the winner's record). A failure here rolls the WHOLE
+                    # transaction back (below), including the CAS.
+                    await self._recovery_store_factory(session).save(recovery)
                 await session.commit()
-            except ProcedureStateConflict:
+            except Exception:
                 await session.rollback()
                 raise
 
         # POST-CAS IDEMPOTENT HIT: another worker with the SAME execution id
         # won the race between our READ and our CAS. Our write did NOT apply,
         # so DISCARD the recomputed turn/state we just produced and return the
-        # ACTUALLY persisted state instead. This makes the same-execution-id
-        # race correct WITHOUT external single-flight.
+        # ACTUALLY persisted state (plus the WINNER's stored recovery record)
+        # instead. This makes the same-execution-id race correct WITHOUT
+        # external single-flight. The winner's record is guaranteed visible:
+        # its CAS and its record committed in ONE transaction, which is what
+        # our non-applied CAS observed.
         if not cas.applied:
+            async with self._session_factory() as session:
+                winner_recovery = await self._read_recovery(
+                    session, conversation_id, execution_id
+                )
             return PersistedTurnResult(
                 conversation_id=conversation_id,
                 turn=None,
                 state=cas.state,
                 revision=cas.revision,
                 replayed=True,
+                recovery=winner_recovery,
             )
 
         return PersistedTurnResult(
@@ -311,6 +396,27 @@ class SupportTurnExecutor:
             turn=turn,
             state=cas.state,
             revision=cas.revision,
+        )
+
+    async def _read_recovery(
+        self,
+        session: AsyncSession,
+        conversation_id: str,
+        execution_id: Optional[str],
+    ) -> Optional[TurnRecoveryPayload]:
+        """Load the stored recovery record of a replayed execution (or None).
+
+        ``None`` when no ``execution_id`` was supplied (nothing to key on), or
+        when the winner stored no record (a legacy caller that supplied no
+        projection snapshot). A present-but-malformed record raises
+        :class:`~support.turn_recovery.TurnRecoveryCorruption` from the store
+        -- NEVER silently coerced to ``None``.
+        """
+        if execution_id is None:
+            return None
+        return await self._recovery_store_factory(session).read(
+            execution_id=execution_id,
+            conversation_id=conversation_id,
         )
 
 

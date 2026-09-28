@@ -23,6 +23,13 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from support.finalized_replay import (
+    FINALIZED_OUTCOMES,
+    KNOWN_OUTCOMES,
+    FinalizedReplayCorruption,
+    FinalizedReplayUnavailable,
+    FinalizedTurnSnapshot,
+)
 from support.models import InboundEvent, ProcessedEvent, Message
 from support.schemas import ClaimResult, ProcessedTurnResult
 
@@ -139,8 +146,24 @@ class IdempotencyService:
         decision: Optional[str] = None,
         reason: Optional[str] = None,
         case_action: Optional[str] = None,
+        *,
+        retrieval_used: Optional[bool] = None,
+        conversation_mode: Optional[str] = None,
+        support_status: Optional[str] = None,
+        handoff_status: Optional[str] = None,
+        external_case_id: Optional[str] = None,
     ) -> None:
-        """Store the turn result metadata (answer text stays in messages)."""
+        """Store the turn result metadata (answer text stays in messages).
+
+        The optional keyword-only fields are the LEVEL A finalized-replay
+        snapshot (HL-2c.3b.1). They are written in the SAME statement /
+        transaction as the rest of the finalization, so the snapshot and the
+        outcome commit or roll back together -- there is never a window where
+        a row claims to be finalized but lacks its replay snapshot. A caller
+        that passes none of them leaves the snapshot columns NULL (the legacy
+        shape), which the reader refuses to replay SILENTLY (it fails closed
+        with :class:`~support.finalized_replay.FinalizedReplayCorruption`).
+        """
         result = await self._session.execute(
             select(InboundEvent).where(
                 InboundEvent.inbound_event_id == inbound_event_id
@@ -155,8 +178,97 @@ class IdempotencyService:
         row.decision = decision
         row.reason = reason
         row.case_action = case_action
+        row.retrieval_used = retrieval_used
+        row.conversation_mode = conversation_mode
+        row.support_status = support_status
+        row.handoff_status = handoff_status
+        row.external_case_id = external_case_id
         row.processed_at = _now()
         await self._session.flush()
+
+    async def load_finalized_replay(
+        self,
+        inbound_event_id: str,
+    ) -> FinalizedTurnSnapshot:
+        """Load the DURABLE replay snapshot of an ALREADY-finalized turn.
+
+        Returns the actual production data for the duplicate path: the
+        persisted scalars PLUS the answer text resolved from the original
+        assistant message (never duplicated into ``inbound_events``). NOT a
+        re-run and NOT a content-free marker.
+
+        Fails closed with a TYPED error, never a best-effort body:
+
+          * nothing to replay (still ``received``, ``rejected`` /
+            ``duplicate``, or an AI outcome with no assistant message) ->
+            :class:`FinalizedReplayUnavailable`;
+          * a damaged / partial finalized record (unknown outcome, dangling
+            ``assistant_message_id``, missing ``retrieval_used`` or lifecycle
+            snapshot) -> :class:`FinalizedReplayCorruption`.
+        """
+        result = await self._session.execute(
+            select(InboundEvent).where(
+                InboundEvent.inbound_event_id == inbound_event_id
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            raise FinalizedReplayUnavailable(
+                f"no inbound event {inbound_event_id!r} is recorded."
+            )
+
+        outcome = row.outcome
+        if outcome not in KNOWN_OUTCOMES:
+            raise FinalizedReplayCorruption(
+                f"inbound event {inbound_event_id!r} has an unrecognized "
+                f"outcome {outcome!r}."
+            )
+        if outcome not in FINALIZED_OUTCOMES:
+            raise FinalizedReplayUnavailable(
+                f"inbound event {inbound_event_id!r} is not a finalized, "
+                f"replayable turn (outcome {outcome!r})."
+            )
+
+        # Resolve the answer text from its single durable source. A NON-
+        # forwarded finalized turn without an assistant message is not a
+        # replayable chat turn (e.g. the START_NEW_SESSION bookkeeping row),
+        # NOT corruption.
+        answer = ""
+        if row.assistant_message_id is None:
+            if outcome != "forwarded":
+                raise FinalizedReplayUnavailable(
+                    f"inbound event {inbound_event_id!r} produced no "
+                    "assistant answer; it is not a replayable chat turn."
+                )
+        else:
+            text_result = await self._session.execute(
+                select(Message.text).where(
+                    Message.id == row.assistant_message_id
+                )
+            )
+            answer = text_result.scalar_one_or_none()
+            if answer is None:
+                raise FinalizedReplayCorruption(
+                    f"inbound event {inbound_event_id!r} references "
+                    f"assistant message {row.assistant_message_id!r}, which "
+                    "does not exist."
+                )
+
+        return FinalizedTurnSnapshot(
+            inbound_event_id=row.inbound_event_id,
+            conversation_id=row.conversation_id,
+            outcome=outcome,
+            assistant_message_id=row.assistant_message_id,
+            answer=answer,
+            decision=row.decision,
+            reason=row.reason,
+            case_action=row.case_action,
+            retrieval_used=row.retrieval_used,
+            conversation_mode=row.conversation_mode,
+            support_status=row.support_status,
+            handoff_status=row.handoff_status,
+            external_case_id=row.external_case_id,
+        )
 
     # ------------------------------------------------------------
     # PROVIDER EVENTS (external callbacks, e.g. Tracker)

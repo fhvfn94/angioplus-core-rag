@@ -220,6 +220,22 @@ class InboundEvent(Base):
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     case_action: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # --- LEVEL A finalized-replay snapshot (HL-2c.3b.1) -------------------
+    # Written ATOMICALLY with the finalize (the SAME transaction) and read
+    # back VERBATIM so a duplicate delivery reproduces the EXACT original
+    # HTTP body from DURABLE values alone (see ``support.finalized_replay``).
+    # The answer text is deliberately NOT duplicated here: it lives once in
+    # ``messages`` and is linked by ``assistant_message_id`` above.
+    #
+    # All NULL until a turn is finalized WITH the snapshot: a legacy finalized
+    # row therefore leaves them NULL and can NEVER replay silently -- the
+    # reader raises ``FinalizedReplayCorruption`` instead of guessing.
+    retrieval_used: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    conversation_mode: Mapped[str | None] = mapped_column(Text, nullable=True)
+    support_status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    handoff_status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    external_case_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

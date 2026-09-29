@@ -20,7 +20,9 @@ ONE turn by DELEGATING to them:
   7. EXACTLY ONE sanctioned runtime module (the Stateful Turn Runtime in
      ``support/runtime_service.py``) imports ``support_core``; every other
      runtime / transport module still does not;
-  8. ``yandex/chat/server.py`` stays untouched by this sub-slice;
+  8. ``yandex/chat/server.py`` is the transport composition root: it reaches
+     ``SupportCore`` ONLY through the ``Stateful Turn Runtime`` (it never
+     imports ``support_core`` directly);
   9. ``handle_turn`` resolves the CANDIDATE Procedure cold-start via
      ``ProcedureCatalog.select`` (unique match -> that Procedure, otherwise
      ``None``) and ALWAYS dispatches the message afterwards (the ONE analysis
@@ -522,7 +524,7 @@ def test_every_dependency_is_injectable():
 
 
 # ============================================================
-# 7-8. NOT WIRED ANYWHERE YET / server.py UNTOUCHED
+# 7-8. THE ONE SUPPORT_CORE OWNER / server.py IS THE COMPOSITION ROOT
 # ============================================================
 
 def _imports_support_core(path: Path) -> bool:
@@ -607,13 +609,18 @@ def test_only_the_sanctioned_runtime_module_imports_support_core():
         assert not _imports_support_core(path), relative
 
 
-def test_server_py_is_untouched_by_this_slice():
+def test_server_py_reaches_support_core_only_through_the_runtime():
     server = _repo_root() / "yandex/chat/server.py"
     assert server.exists()
 
+    # The transport goes through the ONE runtime boundary (a real import) and
+    # NEVER imports the composition boundary (``support_core``) directly. A
+    # comment that merely *mentions* ``support_core`` wires nothing.
+    assert _imports_support_core(server) is False
+
     text = server.read_text(encoding="utf-8")
-    assert "support_core" not in text
-    assert "SupportCore" not in text
+    assert "support.runtime_service" in text
+    assert "StatefulTurnRuntime" in text
     assert "support.alice_analyzer_yandex" not in text
     assert "support.response_generator_yandex" not in text
     assert "YandexKnowledgeBackend" not in text

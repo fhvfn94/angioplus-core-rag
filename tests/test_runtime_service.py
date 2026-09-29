@@ -1072,8 +1072,16 @@ def _imports_module(path: Path, module: str) -> bool:
     return False
 
 
-def test_no_runtime_module_imports_the_runtime_service_yet():
-    offenders: list[str] = []
+def test_only_the_sanctioned_composition_root_imports_the_runtime_service():
+    """Post-cutover: EXACTLY ONE production module wires the runtime.
+
+    ``yandex/chat/server.py`` is the transport composition root (HL-2c.3b.3);
+    it is the ONE place that delegates the turn to the runtime boundary. No
+    OTHER production module -- and no runtime module -- may import it.
+    """
+    sanctioned = {(_REPO_ROOT / "yandex/chat/server.py").resolve()}
+
+    offenders: set[Path] = set()
     for pattern in ("support/**/*.py", "yandex/**/*.py", "*.py"):
         for path in _REPO_ROOT.glob(pattern):
             if path.resolve() == _MODULE_PATH or "__pycache__" in path.parts:
@@ -1081,22 +1089,37 @@ def test_no_runtime_module_imports_the_runtime_service_yet():
             if "tests" in path.parts:
                 continue
             if _imports_module(path, "support.runtime_service"):
-                offenders.append(str(path))
-    assert offenders == []
+                offenders.add(path.resolve())
 
+    assert offenders == sanctioned
+
+    # A runtime module must never import the runtime service (no cycles);
+    # the transport composition root is the ONLY sanctioned importer.
     for relative in _RUNTIME_MODULES:
+        if relative == Path("yandex/chat/server.py"):
+            continue
         path = _REPO_ROOT / relative
         if path.exists():
             assert not _imports_module(path, "support.runtime_service"), relative
 
 
-def test_server_py_is_untouched_by_this_slice():
+def test_server_py_is_the_composition_root_for_the_stateful_cutover():
     server = _REPO_ROOT / "yandex/chat/server.py"
     assert server.exists()
     text = server.read_text(encoding="utf-8")
-    assert "runtime_service" not in text
-    assert "StatefulTurnRuntime" not in text
-    assert "SupportCore" not in text
+
+    # The transport delegates EVERY turn decision to the ONE runtime boundary
+    # and never imports the composition boundary (``support_core``) directly.
+    assert "_turn_runtime" in text
+    assert "StatefulTurnRuntime" in text
+    assert "support.runtime_service" in text
+    assert "support.support_core" not in text
+
+    # The engine's optimistic-CAS conflict maps to a STABLE conflict signal
+    # (409): no retry, no second engine call, no partial write.
+    assert "ProcedureStateConflict" in text
+    assert "procedure_state_conflict" in text
+    assert "status=409" in text
 
 
 def test_not_exported_from_the_support_package_init():
